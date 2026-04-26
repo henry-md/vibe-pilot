@@ -1,6 +1,8 @@
 const ACTIVE_SCRIPT_ID = "vibe-pilot-live-script";
 const STORAGE_KEYS = {
   draft: "vibePilotDraft",
+  pendingHotReload: "vibePilotPendingHotReload",
+  pendingHotReloadTabId: "vibePilotPendingHotReloadTabId",
   backendUrl: "vibePilotBackendUrl",
 };
 const DEFAULT_BACKEND_URL = "http://127.0.0.1:3001";
@@ -44,6 +46,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 
 chrome.runtime.onStartup.addListener(() => {
   void restoreRegisteredScript();
+  void finalizeHotReload();
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -78,6 +81,7 @@ async function bootstrap(reason) {
 
   if (reason === "update") {
     await restoreRegisteredScript();
+    await finalizeHotReload();
   }
 }
 
@@ -93,6 +97,8 @@ async function handleMessage(message) {
       return getDomSummary();
     case "VIBE_PILOT_CLEAR_SCRIPT":
       return clearRegisteredScript();
+    case "VIBE_PILOT_PREPARE_HOT_RELOAD":
+      return prepareHotReload(message.payload);
     case "VIBE_PILOT_SET_BACKEND_URL":
       return saveBackendUrl(message.payload?.backendUrl ?? message.payload);
     case "VIBE_PILOT_SAVE_REMOTE_DRAFT":
@@ -205,6 +211,22 @@ async function clearRegisteredScript() {
   };
 }
 
+async function prepareHotReload(payload) {
+  const draft = normalizeDraft(payload?.draft ?? payload ?? DEFAULT_DRAFT);
+  const activeTab = await getActiveTab();
+
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.draft]: draft,
+    [STORAGE_KEYS.pendingHotReload]: true,
+    [STORAGE_KEYS.pendingHotReloadTabId]: activeTab?.id ?? null,
+  });
+
+  return {
+    prepared: true,
+    tabId: activeTab?.id ?? null,
+  };
+}
+
 async function restoreRegisteredScript() {
   const draft = await loadDraft();
   if (!draft) {
@@ -217,6 +239,33 @@ async function restoreRegisteredScript() {
   }
 
   await registerLiveScript(draft);
+}
+
+async function finalizeHotReload() {
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.pendingHotReload,
+    STORAGE_KEYS.pendingHotReloadTabId,
+  ]);
+
+  if (!stored[STORAGE_KEYS.pendingHotReload]) {
+    return;
+  }
+
+  await chrome.storage.local.remove([
+    STORAGE_KEYS.pendingHotReload,
+    STORAGE_KEYS.pendingHotReloadTabId,
+  ]);
+
+  const tabId = stored[STORAGE_KEYS.pendingHotReloadTabId];
+  if (typeof tabId !== "number") {
+    return;
+  }
+
+  try {
+    await chrome.tabs.reload(tabId);
+  } catch {
+    // Ignore tabs that disappeared while the extension was reloading.
+  }
 }
 
 async function registerLiveScript(draft) {

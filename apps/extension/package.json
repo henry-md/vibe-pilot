@@ -2,6 +2,7 @@
   "name": "@vibe-pilot/extension",
   "private": true,
   "scripts": {
+    "dev": "node scripts/build-extension.mjs --watch",
     "build": "node scripts/build-extension.mjs",
     "lint": "node --check src/content-script.js && node --check src/service-worker.js && node --check src/sidepanel.js"
   },

@@ -1,3 +1,5 @@
+import { HOT_RELOAD_ENABLED, HOT_RELOAD_URL } from "./config.js";
+
 const defaultDraft = {
   matchPattern: "*://*/*",
   html: [
@@ -33,6 +35,7 @@ const defaultDraft = {
 
 const state = {
   hydrated: false,
+  hotReloading: false,
 };
 
 const elements = {
@@ -67,6 +70,7 @@ boot();
 
 async function boot() {
   wireEvents();
+  wireHotReload();
   await refreshStatus({ hydrateDraft: true });
 }
 
@@ -223,6 +227,46 @@ async function sendMessage(type, payload) {
   }
 
   return response.payload;
+}
+
+function wireHotReload() {
+  if (!HOT_RELOAD_ENABLED || typeof EventSource === "undefined") {
+    return;
+  }
+
+  const source = new EventSource(`${HOT_RELOAD_URL}/__hot-reload`);
+
+  source.addEventListener("reload", () => {
+    void handleHotReload(source);
+  });
+}
+
+async function handleHotReload(source) {
+  if (state.hotReloading) {
+    return;
+  }
+
+  state.hotReloading = true;
+  toggleBusy(true);
+  setError("");
+  setStatus("Extension source changed. Reloading the unpacked build...");
+
+  try {
+    await sendMessage("VIBE_PILOT_PREPARE_HOT_RELOAD", {
+      draft: readDraft(),
+    });
+  } catch (error) {
+    console.warn("Unable to persist draft before hot reload.", error);
+  }
+
+  source.close();
+
+  if (chrome.runtime?.reload) {
+    chrome.runtime.reload();
+    return;
+  }
+
+  window.location.reload();
 }
 
 function renderStatus(payload) {

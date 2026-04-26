@@ -39,7 +39,21 @@ npm run dev:web
 
 The local backend will default to [http://127.0.0.1:3001](http://127.0.0.1:3001) on this machine because port `3000` is already in use elsewhere. You can still override `PORT` if you want a different port.
 
-Build the unpacked extension:
+Start the full local dev loop:
+
+```bash
+npm run dev
+```
+
+That runs the Next.js app and the extension watcher together. If you prefer to split them, use `npm run dev:web` and `npm run dev:extension` in separate terminals.
+
+The extension watcher will:
+
+- rebuild `apps/extension/dist` whenever `apps/extension/src` changes
+- point the unpacked extension at the local backend by default
+- publish a local reload stream on `http://127.0.0.1:35729/__hot-reload`
+
+Build a one-off unpacked extension bundle without the watcher:
 
 ```bash
 npm run build:extension
@@ -53,7 +67,7 @@ Load it in Chrome:
 4. Choose `/Users/Henry/Developer/vibe-pilot/apps/extension/dist`.
 5. Open the extension details page and enable `Allow User Scripts` if Chrome shows that toggle.
 6. Click the extension action to open the side panel.
-7. Open the extension's Options page if you want the same UI in a normal tab for easier local debugging and automated verification.
+7. Open the extension's Options page if you want the same UI in a normal tab for easier local debugging and automated verification. Keeping the side panel or Options page open lets the watcher trigger automatic extension reloads after file saves.
 
 ## Project Map
 

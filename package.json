@@ -5,8 +5,10 @@
     "apps/*"
   ],
   "scripts": {
+    "dev": "node scripts/dev-workspace.mjs",
     "postinstall": "npm run prisma:generate",
     "dev:web": "PORT=${PORT:-3001} npm run dev --workspace @vibe-pilot/web",
+    "dev:extension": "npm run dev --workspace @vibe-pilot/extension",
     "build": "npm run build:web && npm run build:extension",
     "build:web": "npm run build --workspace @vibe-pilot/web",
     "start:web": "PORT=${PORT:-3001} npm run start --workspace @vibe-pilot/web",
