@@ -1,0 +1,11 @@
+{
+  "name": "@vibe-pilot/extension",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build-extension.mjs",
+    "lint": "node --check src/content-script.js && node --check src/service-worker.js && node --check src/sidepanel.js"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.40"
+  }
+}

@@ -1,0 +1,22 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model ScriptDraft {
+  id           String   @id @default(cuid())
+  name         String   @default("Untitled draft")
+  source       String   @default("extension")
+  targetUrl    String?  @db.Text
+  targetTitle  String?
+  matchPattern String   @default("*://*/*")
+  html         String   @default("") @db.Text
+  css          String   @default("") @db.Text
+  javascript   String   @default("") @db.Text
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}

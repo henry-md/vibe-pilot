@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vibe Pilot Debug View</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <p class="kicker">Apps/Extension</p>
+        <h1>Vibe Pilot</h1>
+        <p class="copy">
+          This tab mirrors the live side panel so we can test the extension UI
+          directly during local development.
+        </p>
+      </header>
+
+      <section class="status-strip">
+        <article class="status-card">
+          <span class="label">Runtime</span>
+          <strong id="runtime-value">Loading...</strong>
+          <p id="runtime-message">Checking the extension runtime.</p>
+        </article>
+        <article class="status-card">
+          <span class="label">User Scripts</span>
+          <strong id="user-scripts-value">Loading...</strong>
+          <p id="user-scripts-message">Checking Chrome permissions.</p>
+        </article>
+        <article class="status-card">
+          <span class="label">Live Draft</span>
+          <strong id="live-draft-value">Loading...</strong>
+          <p id="live-draft-message">Checking registered scripts.</p>
+        </article>
+      </section>
+
+      <section class="panel-grid">
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <span class="label">Targeting</span>
+              <h2>Local + remote draft editing</h2>
+            </div>
+            <div class="button-row">
+              <button class="secondary-button" id="save-local-button" type="button">
+                Save Local
+              </button>
+              <button class="secondary-button" id="save-remote-button" type="button">
+                Save Remote
+              </button>
+              <button class="primary-button" id="apply-draft-button" type="button">
+                Apply Draft
+              </button>
+            </div>
+          </div>
+
+          <label class="field">
+            <span>Backend URL</span>
+            <input id="backend-url" type="url" placeholder="http://127.0.0.1:3001" />
+          </label>
+
+          <label class="field">
+            <span>Match pattern</span>
+            <input id="match-pattern" type="text" placeholder="*://*/*" />
+          </label>
+
+          <label class="field">
+            <span>HTML snippet</span>
+            <textarea id="html-snippet" rows="8"></textarea>
+          </label>
+
+          <label class="field">
+            <span>CSS snippet</span>
+            <textarea id="css-snippet" rows="10"></textarea>
+          </label>
+
+          <label class="field">
+            <span>JavaScript snippet</span>
+            <textarea id="javascript-snippet" rows="12"></textarea>
+          </label>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <span class="label">Context</span>
+              <h2>Active tab + backend preview</h2>
+            </div>
+            <div class="button-row">
+              <button class="secondary-button" id="load-remote-button" type="button">
+                Load Remote
+              </button>
+              <button class="secondary-button" id="inspect-button" type="button">
+                Inspect Page
+              </button>
+              <button class="ghost-button" id="clear-script-button" type="button">
+                Clear Script
+              </button>
+            </div>
+          </div>
+
+          <div class="meta-grid">
+            <article class="meta-card">
+              <span class="label">Active tab</span>
+              <strong id="active-tab-title">Waiting for tab data...</strong>
+              <p id="active-tab-url">Open a normal page in the current window.</p>
+            </article>
+            <article class="meta-card">
+              <span class="label">Backend</span>
+              <strong id="backend-status-value">Not checked</strong>
+              <p id="backend-status-message">Remote draft list has not been loaded yet.</p>
+            </article>
+          </div>
+
+          <div class="snapshot">
+            <div class="snapshot-block">
+              <span class="label">Remote drafts</span>
+              <div class="remote-list" id="remote-drafts">
+                <p class="empty-inline">Nothing loaded from the backend yet.</p>
+              </div>
+            </div>
+            <div class="snapshot-block">
+              <span class="label">DOM snapshot</span>
+              <pre id="dom-summary">Inspect a page to capture headings, buttons, and a text preview.</pre>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <p class="status-banner" id="status-banner">Loading extension state...</p>
+      <p class="error-banner is-hidden" id="error-banner"></p>
+    </main>
+
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

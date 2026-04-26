@@ -1,24 +1,25 @@
 {
   "name": "vibe-pilot",
-  "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
-  },
-  "dependencies": {
-    "next": "16.2.4",
-    "react": "19.2.4",
-    "react-dom": "19.2.4"
-  },
-  "devDependencies": {
-    "@types/node": "^20",
-    "@types/react": "^19",
-    "@types/react-dom": "^19",
-    "eslint": "^9",
-    "eslint-config-next": "16.2.4",
-    "typescript": "^5"
+    "postinstall": "npm run prisma:generate",
+    "dev:web": "PORT=${PORT:-3001} npm run dev --workspace @vibe-pilot/web",
+    "build": "npm run build:web && npm run build:extension",
+    "build:web": "npm run build --workspace @vibe-pilot/web",
+    "start:web": "PORT=${PORT:-3001} npm run start --workspace @vibe-pilot/web",
+    "lint": "npm run lint:web && npm run lint:extension",
+    "lint:web": "npm run lint --workspace @vibe-pilot/web",
+    "lint:extension": "npm run lint --workspace @vibe-pilot/extension",
+    "build:extension": "npm run build --workspace @vibe-pilot/extension",
+    "db:start": "docker compose --env-file apps/web/.env up -d postgres",
+    "db:stop": "docker compose --env-file apps/web/.env down",
+    "db:reset": "docker compose --env-file apps/web/.env down -v",
+    "prisma:generate": "npm run prisma:generate --workspace @vibe-pilot/web",
+    "prisma:migrate": "npm run prisma:migrate --workspace @vibe-pilot/web",
+    "prisma:deploy": "npm run prisma:deploy --workspace @vibe-pilot/web",
+    "prisma:studio": "npm run prisma:studio --workspace @vibe-pilot/web"
   }
 }

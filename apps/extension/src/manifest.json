@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Vibe Pilot",
+  "description": "Local-only Chrome extension shell for dynamic user scripts and DOM inspection.",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6CFIf9Cb75GML+Eyyv6ryAc35/ZJgHW/pulq655gWQ4ZxC9peXCfxMbAeYZMQma0e4A7cwmWCMBNaGUJl9dqo4+0nOsFlpUMsSFlkkFJErP16T1gpm2F5OIyqFBd9roFBekqAX1GSWZoy785+HX5sYPXBdcCrdXSAZk4pL+CtzirMbw/ROC7TWYbEWFTJf4t0kHdT3TYotbySI5KS3KZNhHmVjHGPTcZ2RHNSEafkHFKAFB8A3HloCy7IPu7HuzDZ/UKUmRFOrhsm6PV5f/sOxONYv+ZHfjWgZLvZlHw1iwOTovMXq0djbTZbSWr5xfB0eaeHkO2XkdWQRrdrwYCXQIDAQAB",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "tabs",
+    "userScripts"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Vibe Pilot"
+  },
+  "options_page": "options.html",
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "options.html",
+        "sidepanel.html",
+        "sidepanel.css",
+        "sidepanel.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content-script.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

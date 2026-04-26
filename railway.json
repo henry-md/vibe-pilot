@@ -1,0 +1,10 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "buildCommand": "npm run build:web"
+  },
+  "deploy": {
+    "preDeployCommand": "npm run prisma:deploy",
+    "startCommand": "npm run start:web"
+  }
+}

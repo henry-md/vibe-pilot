@@ -1,36 +1,81 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+## Vibe Pilot
 
-## Getting Started
+This repo is now split into two clear apps:
 
-First, run the development server:
+- [`apps/web`](/Users/Henry/Developer/vibe-pilot/apps/web/package.json:1): the real Next.js web app and backend API. It owns Prisma, Postgres access, and deploys to Railway.
+- [`apps/extension`](/Users/Henry/Developer/vibe-pilot/apps/extension/package.json:1): the unpacked Chrome extension. It owns the side panel, content script, and `userScripts` runtime.
+
+## Development
+
+Install dependencies once from the repo root:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Create the web env file:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+cp apps/web/.env.example apps/web/.env
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Start local Postgres:
 
-## Learn More
+```bash
+npm run db:start
+```
 
-To learn more about Next.js, take a look at the following resources:
+Run Prisma locally:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npm run prisma:migrate -- --name init
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Start the web app:
 
-## Deploy on Vercel
+```bash
+npm run dev:web
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The local backend will default to [http://127.0.0.1:3001](http://127.0.0.1:3001) on this machine because port `3000` is already in use elsewhere. You can still override `PORT` if you want a different port.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Build the unpacked extension:
+
+```bash
+npm run build:extension
+```
+
+Load it in Chrome:
+
+1. Open `chrome://extensions`.
+2. Turn on Developer Mode.
+3. Click `Load unpacked`.
+4. Choose `/Users/Henry/Developer/vibe-pilot/apps/extension/dist`.
+5. Open the extension details page and enable `Allow User Scripts` if Chrome shows that toggle.
+6. Click the extension action to open the side panel.
+7. Open the extension's Options page if you want the same UI in a normal tab for easier local debugging and automated verification.
+
+## Project Map
+
+- [`apps/web/src/app/page.tsx`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/page.tsx:1): the web dashboard landing page
+- [`apps/web/src/app/api/health/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/health/route.ts:1): health probe for Railway and local checks
+- [`apps/web/src/app/api/script-drafts/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/script-drafts/route.ts:1): draft persistence API
+- [`apps/web/prisma/schema.prisma`](/Users/Henry/Developer/vibe-pilot/apps/web/prisma/schema.prisma:1): Postgres schema for saved script drafts
+- [`apps/extension/src/service-worker.js`](/Users/Henry/Developer/vibe-pilot/apps/extension/src/service-worker.js:1): extension orchestration, local storage, remote save/load
+- [`apps/extension/src/sidepanel.js`](/Users/Henry/Developer/vibe-pilot/apps/extension/src/sidepanel.js:1): extension UI logic
+
+## Railway
+
+This repo includes a root [`railway.json`](/Users/Henry/Developer/vibe-pilot/railway.json:1) that tells Railway to:
+
+- build the web app with `npm run build:web`
+- start the web app with `npm run start:web`
+- run Prisma migrations before deploy with `npm run prisma:deploy`
+
+On Railway you still need to:
+
+1. Create a new project from this repo.
+2. Add a PostgreSQL service.
+3. In the web service, add a reference variable for `DATABASE_URL` from the Postgres service.
+4. Generate a public domain for the web service.
+5. Put that public URL into the extension side panel as the backend URL when you want remote draft saves outside local development.
