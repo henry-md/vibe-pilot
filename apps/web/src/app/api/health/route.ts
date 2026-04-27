@@ -10,7 +10,7 @@ const CORS_HEADERS = {
 export async function GET() {
   try {
     const prisma = await getPrisma();
-    const draftCount = await prisma.scriptDraft.count();
+    const ruleCount = await prisma.rule.count();
 
     return NextResponse.json(
       {
@@ -19,7 +19,7 @@ export async function GET() {
         timestamp: new Date().toISOString(),
         database: {
           connected: true,
-          draftCount,
+          ruleCount,
         },
       },
       {

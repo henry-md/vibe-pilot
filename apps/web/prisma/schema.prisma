@@ -7,10 +7,9 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model ScriptDraft {
+model Rule {
   id           String   @id @default(cuid())
-  name         String   @default("Untitled draft")
-  source       String   @default("extension")
+  name         String
   targetUrl    String?  @db.Text
   targetTitle  String?
   matchPattern String   @default("*://*/*")

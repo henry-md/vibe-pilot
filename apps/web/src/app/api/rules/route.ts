@@ -7,9 +7,8 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-type DraftInput = {
+type RuleInput = {
   name: string;
-  source: string;
   targetUrl: string | null;
   targetTitle: string | null;
   matchPattern: string;
@@ -20,14 +19,14 @@ type DraftInput = {
 
 export async function GET(request: NextRequest) {
   const url = new URL(request.url);
-  const limitParam = Number.parseInt(url.searchParams.get("limit") ?? "10", 10);
+  const limitParam = Number.parseInt(url.searchParams.get("limit") ?? "25", 10);
   const limit = Number.isNaN(limitParam)
-    ? 10
-    : Math.min(Math.max(limitParam, 1), 50);
+    ? 25
+    : Math.min(Math.max(limitParam, 1), 100);
 
   try {
     const prisma = await getPrisma();
-    const drafts = await prisma.scriptDraft.findMany({
+    const rules = await prisma.rule.findMany({
       orderBy: {
         updatedAt: "desc",
       },
@@ -36,7 +35,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(
       {
-        drafts,
+        rules,
       },
       {
         headers: CORS_HEADERS,
@@ -48,7 +47,7 @@ export async function GET(request: NextRequest) {
         error:
           error instanceof Error
             ? error.message
-            : "Unable to load drafts from Postgres.",
+            : "Unable to load rules from Postgres.",
       },
       {
         status: 500,
@@ -75,17 +74,31 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const draft = normalizeDraftInput(payload);
+  let rule: RuleInput;
+
+  try {
+    rule = normalizeRuleInput(payload);
+  } catch (error) {
+    return NextResponse.json(
+      {
+        error: error instanceof Error ? error.message : "Rule payload was invalid.",
+      },
+      {
+        status: 400,
+        headers: CORS_HEADERS,
+      },
+    );
+  }
 
   try {
     const prisma = await getPrisma();
-    const created = await prisma.scriptDraft.create({
-      data: draft,
+    const created = await prisma.rule.create({
+      data: rule,
     });
 
     return NextResponse.json(
       {
-        draft: created,
+        rule: created,
       },
       {
         status: 201,
@@ -98,7 +111,7 @@ export async function POST(request: NextRequest) {
         error:
           error instanceof Error
             ? error.message
-            : "Unable to save the draft.",
+            : "Unable to save the rule.",
       },
       {
         status: 500,
@@ -115,13 +128,12 @@ export async function OPTIONS() {
   });
 }
 
-function normalizeDraftInput(payload: unknown): DraftInput {
+function normalizeRuleInput(payload: unknown): RuleInput {
   const value = payload && typeof payload === "object" ? payload : {};
   const record = value as Record<string, unknown>;
 
   return {
-    name: readString(record.name, defaultDraftName()),
-    source: readString(record.source, "extension"),
+    name: readRequiredString(record.name, "Rule name is required."),
     targetUrl: readOptionalString(record.targetUrl),
     targetTitle: readOptionalString(record.targetTitle),
     matchPattern: readString(record.matchPattern, "*://*/*"),
@@ -129,6 +141,19 @@ function normalizeDraftInput(payload: unknown): DraftInput {
     css: readText(record.css),
     javascript: readText(record.javascript),
   };
+}
+
+function readRequiredString(value: unknown, errorMessage: string) {
+  if (typeof value !== "string") {
+    throw new Error(errorMessage);
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(errorMessage);
+  }
+
+  return trimmed;
 }
 
 function readString(value: unknown, fallback: string) {
@@ -151,8 +176,4 @@ function readOptionalString(value: unknown) {
 
 function readText(value: unknown) {
   return typeof value === "string" ? value : "";
-}
-
-function defaultDraftName() {
-  return `Draft ${new Date().toISOString()}`;
 }

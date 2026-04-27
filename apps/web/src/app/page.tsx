@@ -6,18 +6,18 @@ export const dynamic = "force-dynamic";
 async function getDashboardSnapshot() {
   try {
     const prisma = await getPrisma();
-    const [draftCount, latestDrafts] = await Promise.all([
-      prisma.scriptDraft.count(),
-      prisma.scriptDraft.findMany({
+    const [ruleCount, latestRules] = await Promise.all([
+      prisma.rule.count(),
+      prisma.rule.findMany({
         orderBy: {
           updatedAt: "desc",
         },
-        take: 3,
+        take: 6,
         select: {
           id: true,
           name: true,
-          source: true,
           targetUrl: true,
+          matchPattern: true,
           updatedAt: true,
         },
       }),
@@ -25,15 +25,15 @@ async function getDashboardSnapshot() {
 
     return {
       databaseReady: true,
-      draftCount,
-      latestDrafts,
-      databaseMessage: "Postgres is connected and ready for extension draft storage.",
+      ruleCount,
+      latestRules,
+      databaseMessage: "Postgres is connected and ready for named rule storage.",
     };
   } catch (error) {
     return {
       databaseReady: false,
-      draftCount: 0,
-      latestDrafts: [],
+      ruleCount: 0,
+      latestRules: [],
       databaseMessage:
         error instanceof Error
           ? error.message
@@ -54,7 +54,7 @@ export default async function Home() {
           <p className={styles.lead}>
             This Next.js app is now the real backend surface for the extension.
             It owns Prisma, Postgres, Railway deploys, and the first persistence
-            API for script drafts.
+            API for named DOM-edit rules.
           </p>
         </div>
         <div className={styles.heroCard}>
@@ -69,7 +69,7 @@ export default async function Home() {
           <span className={styles.label}>Web app</span>
           <h2>What lives here</h2>
           <ul className={styles.list}>
-            <li>API routes for saving and reading script drafts</li>
+            <li>API routes for saving, updating, listing, and deleting rules</li>
             <li>Prisma client and Postgres schema ownership</li>
             <li>Railway deployment target for production</li>
           </ul>
@@ -79,17 +79,17 @@ export default async function Home() {
           <span className={styles.label}>Extension</span>
           <h2>What stays in Chrome</h2>
           <ul className={styles.list}>
-            <li>Side panel chat and editor UI</li>
+            <li>Side panel chat and page-edit UI</li>
             <li>Content script DOM inspection</li>
-            <li>`userScripts` registration and page injection</li>
+            <li>Live rule registration and page injection</li>
           </ul>
         </article>
 
         <article className={styles.card}>
           <span className={styles.label}>Persistence</span>
-          <h2>Current draft inventory</h2>
-          <p className={styles.metric}>{snapshot.draftCount}</p>
-          <p className={styles.cardCopy}>Saved remote drafts in Postgres.</p>
+          <h2>Current rule inventory</h2>
+          <p className={styles.metric}>{snapshot.ruleCount}</p>
+          <p className={styles.cardCopy}>Saved named rules in Postgres.</p>
         </article>
       </section>
 
@@ -107,12 +107,24 @@ export default async function Home() {
               <p>Confirms the app is live and reports database connectivity.</p>
             </div>
             <div className={styles.endpoint}>
-              <code>GET /api/script-drafts?limit=5</code>
-              <p>Returns recent saved drafts for the extension or dashboard.</p>
+              <code>GET /api/rules?limit=25</code>
+              <p>Returns saved rules for the extension or dashboard.</p>
             </div>
             <div className={styles.endpoint}>
-              <code>POST /api/script-drafts</code>
-              <p>Saves a new draft payload from the extension or future chat loop.</p>
+              <code>POST /api/rules</code>
+              <p>Creates a new named rule from the extension or future chat loop.</p>
+            </div>
+            <div className={styles.endpoint}>
+              <code>PATCH /api/rules/:id</code>
+              <p>Updates an existing named rule after edits from the extension.</p>
+            </div>
+            <div className={styles.endpoint}>
+              <code>DELETE /api/rules/:id</code>
+              <p>Deletes a saved rule from the rules tab or dashboard.</p>
+            </div>
+            <div className={styles.endpoint}>
+              <code>POST /api/assistant</code>
+              <p>Turns a chat prompt plus page context into a structured DOM-edit rule.</p>
             </div>
           </div>
         </article>
@@ -120,30 +132,29 @@ export default async function Home() {
         <article className={styles.panel}>
           <div className={styles.panelHeader}>
             <div>
-              <span className={styles.label}>Recent drafts</span>
+              <span className={styles.label}>Recent rules</span>
               <h2>Latest saved items</h2>
             </div>
           </div>
-          {snapshot.latestDrafts.length > 0 ? (
+          {snapshot.latestRules.length > 0 ? (
             <div className={styles.draftList}>
-              {snapshot.latestDrafts.map((draft) => (
-                <div className={styles.draftCard} key={draft.id}>
-                  <strong>{draft.name}</strong>
-                  <p>{draft.targetUrl ?? "No target URL saved yet."}</p>
+              {snapshot.latestRules.map((rule) => (
+                <div className={styles.draftCard} key={rule.id}>
+                  <strong>{rule.name}</strong>
+                  <p>{rule.targetUrl ?? rule.matchPattern}</p>
                   <span>
-                    {draft.source} · updated{" "}
+                    updated{" "}
                     {new Intl.DateTimeFormat("en-US", {
                       dateStyle: "medium",
                       timeStyle: "short",
-                    }).format(draft.updatedAt)}
+                    }).format(rule.updatedAt)}
                   </span>
                 </div>
               ))}
             </div>
           ) : (
             <div className={styles.emptyState}>
-              No remote drafts yet. Save one from the extension side panel once
-              the backend URL is set.
+              No saved rules yet. Create one from the extension to populate this inventory.
             </div>
           )}
         </article>
