@@ -3,130 +3,213 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vibe Pilot Debug View</title>
+    <title>Vibe Pilot</title>
     <link rel="stylesheet" href="sidepanel.css" />
   </head>
-  <body>
+  <body class="surface surface-debug">
     <main class="shell">
-      <header class="hero">
-        <p class="kicker">Apps/Extension</p>
-        <h1>Vibe Pilot</h1>
-        <p class="copy">
-          This tab mirrors the live side panel so we can test the extension UI
-          directly during local development.
-        </p>
+      <header class="hero-card">
+        <div class="hero-top">
+          <div class="title-lockup">
+            <p class="kicker">Local extension</p>
+            <h1>Vibe Pilot</h1>
+            <p class="copy">Generate a tiny DOM rule for the page in front of you.</p>
+          </div>
+
+          <div class="status-cluster">
+            <article class="status-pill">
+              <span class="pill-label">Scripts</span>
+              <strong id="user-scripts-value">Loading...</strong>
+            </article>
+            <article class="status-pill">
+              <span class="pill-label">Rule</span>
+              <strong id="live-draft-value">Loading...</strong>
+            </article>
+          </div>
+        </div>
+
+        <div class="page-surface">
+          <span class="label">Current page</span>
+          <strong id="active-tab-title">Waiting for tab data...</strong>
+          <p id="active-tab-url">Open a normal page in the current window.</p>
+        </div>
       </header>
 
-      <section class="status-strip">
-        <article class="status-card">
-          <span class="label">Runtime</span>
-          <strong id="runtime-value">Loading...</strong>
-          <p id="runtime-message">Checking the extension runtime.</p>
-        </article>
-        <article class="status-card">
-          <span class="label">User Scripts</span>
-          <strong id="user-scripts-value">Loading...</strong>
-          <p id="user-scripts-message">Checking Chrome permissions.</p>
-        </article>
-        <article class="status-card">
-          <span class="label">Live Draft</span>
-          <strong id="live-draft-value">Loading...</strong>
-          <p id="live-draft-message">Checking registered scripts.</p>
-        </article>
-      </section>
+      <nav class="surface-tabs" aria-label="Extension views">
+        <button
+          class="surface-tab is-active"
+          id="view-create-button"
+          type="button"
+          data-view-target="create"
+        >
+          Create
+        </button>
+        <button
+          class="surface-tab"
+          id="view-rules-button"
+          type="button"
+          data-view-target="rules"
+        >
+          Rules
+        </button>
+      </nav>
 
-      <section class="panel-grid">
-        <article class="panel">
+      <div class="view-panel is-active" data-view-panel="create">
+        <section class="composer-card">
           <div class="panel-header">
             <div>
-              <span class="label">Targeting</span>
-              <h2>Local + remote draft editing</h2>
-            </div>
-            <div class="button-row">
-              <button class="secondary-button" id="save-local-button" type="button">
-                Save Local
-              </button>
-              <button class="secondary-button" id="save-remote-button" type="button">
-                Save Remote
-              </button>
-              <button class="primary-button" id="apply-draft-button" type="button">
-                Apply Draft
-              </button>
+              <span class="label">Prompt</span>
+              <h2>What should change?</h2>
             </div>
           </div>
 
           <label class="field">
-            <span>Backend URL</span>
-            <input id="backend-url" type="url" placeholder="http://127.0.0.1:3001" />
+            <span>Rule name</span>
+            <input
+              id="rule-name"
+              type="text"
+              placeholder="Example: Docs badge"
+            />
           </label>
 
-          <label class="field">
-            <span>Match pattern</span>
-            <input id="match-pattern" type="text" placeholder="*://*/*" />
+          <p class="helper-copy" id="sample-rule-copy">
+            Name the rule, generate or edit the code, then apply it when it is ready.
+          </p>
+
+          <label class="field field-plain">
+            <textarea
+              id="chat-input"
+              rows="6"
+              placeholder="Example: Turn the Hello world pill into a small teal release note badge in the lower left that only appears on docs.google.com."
+            ></textarea>
           </label>
 
-          <label class="field">
-            <span>HTML snippet</span>
-            <textarea id="html-snippet" rows="8"></textarea>
-          </label>
+          <div class="button-row button-row-main">
+            <button class="primary-button" id="generate-button" type="button">
+              Generate Rule
+            </button>
+          </div>
+        </section>
 
-          <label class="field">
-            <span>CSS snippet</span>
-            <textarea id="css-snippet" rows="10"></textarea>
-          </label>
+        <section class="assistant-output is-hidden" id="assistant-output">
+          <div class="assistant-output-row">
+            <span class="label">Latest rule</span>
+            <strong id="assistant-rule-summary"></strong>
+          </div>
 
-          <label class="field">
-            <span>JavaScript snippet</span>
-            <textarea id="javascript-snippet" rows="12"></textarea>
-          </label>
-        </article>
+          <ul class="check-list" id="assistant-checks"></ul>
+        </section>
 
-        <article class="panel">
-          <div class="panel-header">
-            <div>
-              <span class="label">Context</span>
-              <h2>Active tab + backend preview</h2>
-            </div>
-            <div class="button-row">
-              <button class="secondary-button" id="load-remote-button" type="button">
-                Load Remote
+        <details class="advanced-panel">
+          <summary>
+            <span>Advanced</span>
+            <span class="advanced-summary">Code</span>
+          </summary>
+
+          <div class="advanced-body">
+            <p class="copy" id="advanced-copy">
+              Edit the current rule directly if you want finer control.
+            </p>
+
+            <label class="field">
+              <span>Match pattern</span>
+              <input id="match-pattern" type="text" placeholder="*://*/*" />
+            </label>
+
+            <div class="editor-tabs" aria-label="Rule code sections">
+              <button
+                class="editor-tab is-active"
+                id="editor-tab-html"
+                type="button"
+                data-editor-target="html"
+              >
+                HTML
               </button>
-              <button class="secondary-button" id="inspect-button" type="button">
-                Inspect Page
+              <button
+                class="editor-tab"
+                id="editor-tab-css"
+                type="button"
+                data-editor-target="css"
+              >
+                CSS
+              </button>
+              <button
+                class="editor-tab"
+                id="editor-tab-javascript"
+                type="button"
+                data-editor-target="javascript"
+              >
+                JS
+              </button>
+            </div>
+
+            <div class="editor-panels">
+              <label class="field editor-panel is-active" data-editor-panel="html">
+                <span>HTML snippet</span>
+                <textarea id="html-snippet" rows="10"></textarea>
+              </label>
+              <label class="field editor-panel" data-editor-panel="css">
+                <span>CSS snippet</span>
+                <textarea id="css-snippet" rows="10"></textarea>
+              </label>
+              <label class="field editor-panel" data-editor-panel="javascript">
+                <span>JavaScript snippet</span>
+                <textarea id="javascript-snippet" rows="10"></textarea>
+              </label>
+            </div>
+
+            <div class="action-dock">
+              <button
+                class="icon-button"
+                id="revert-example-button"
+                type="button"
+                title="Revert to example"
+                aria-label="Revert to example"
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    d="M4.5 5.5H1.75V2.75M2 5a6 6 0 1 1 .82 6.4"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="1.4"
+                  />
+                </svg>
               </button>
               <button class="ghost-button" id="clear-script-button" type="button">
-                Clear Script
+                Clear Live Rule
+              </button>
+              <button class="primary-button" id="apply-draft-button" type="button">
+                Apply
               </button>
             </div>
           </div>
+        </details>
+      </div>
 
-          <div class="meta-grid">
-            <article class="meta-card">
-              <span class="label">Active tab</span>
-              <strong id="active-tab-title">Waiting for tab data...</strong>
-              <p id="active-tab-url">Open a normal page in the current window.</p>
-            </article>
-            <article class="meta-card">
-              <span class="label">Backend</span>
-              <strong id="backend-status-value">Not checked</strong>
-              <p id="backend-status-message">Remote draft list has not been loaded yet.</p>
-            </article>
+      <div class="view-panel is-hidden" data-view-panel="rules">
+        <section class="rules-panel">
+          <div class="panel-header">
+            <div>
+              <span class="label">Saved rules</span>
+              <h2>Manage rules</h2>
+            </div>
+
+            <button class="ghost-button" id="refresh-rules-button" type="button">
+              Refresh
+            </button>
           </div>
 
-          <div class="snapshot">
-            <div class="snapshot-block">
-              <span class="label">Remote drafts</span>
-              <div class="remote-list" id="remote-drafts">
-                <p class="empty-inline">Nothing loaded from the backend yet.</p>
-              </div>
-            </div>
-            <div class="snapshot-block">
-              <span class="label">DOM snapshot</span>
-              <pre id="dom-summary">Inspect a page to capture headings, buttons, and a text preview.</pre>
-            </div>
+          <p class="copy">
+            AI-created and custom-created rules live together here as the same saved asset.
+          </p>
+
+          <div class="rules-list" id="rules-list">
+            <p class="empty-inline">No saved rules yet.</p>
           </div>
-        </article>
-      </section>
+        </section>
+      </div>
 
       <p class="status-banner" id="status-banner">Loading extension state...</p>
       <p class="error-banner is-hidden" id="error-banner"></p>
