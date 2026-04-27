@@ -19,6 +19,19 @@ Create the web env file:
 cp apps/web/.env.example apps/web/.env
 ```
 
+Create the extension env file:
+
+```bash
+cp apps/extension/.env.example apps/extension/.env
+```
+
+Add your OpenAI key in `apps/web/.env`:
+
+```bash
+OPENAI_API_KEY="replace-with-openai-key"
+OPENAI_MODEL="gpt-5"
+```
+
 Start local Postgres:
 
 ```bash
@@ -50,8 +63,11 @@ That runs the Next.js app and the extension watcher together. If you prefer to s
 The extension watcher will:
 
 - rebuild `apps/extension/dist` whenever `apps/extension/src` changes
-- point the unpacked extension at the local backend by default
+- read `apps/extension/.env` first for the backend URL and hot-reload settings
+- fall back to the local backend during `npm run dev:extension` if no backend URL is set
 - publish a local reload stream on `http://127.0.0.1:35729/__hot-reload`
+
+If you want the unpacked extension to hit your local backend during development, change `VIBE_PILOT_BACKEND_URL` in `apps/extension/.env` to `http://127.0.0.1:3001` before running the extension build or watcher.
 
 Build a one-off unpacked extension bundle without the watcher:
 
@@ -73,8 +89,12 @@ Load it in Chrome:
 
 - [`apps/web/src/app/page.tsx`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/page.tsx:1): the web dashboard landing page
 - [`apps/web/src/app/api/health/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/health/route.ts:1): health probe for Railway and local checks
-- [`apps/web/src/app/api/script-drafts/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/script-drafts/route.ts:1): draft persistence API
-- [`apps/web/prisma/schema.prisma`](/Users/Henry/Developer/vibe-pilot/apps/web/prisma/schema.prisma:1): Postgres schema for saved script drafts
+- [`apps/web/src/app/api/rules/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/rules/route.ts:1): named rule list/create API
+- [`apps/web/src/app/api/rules/[ruleId]/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/rules/[ruleId]/route.ts:1): named rule update/delete API
+- [`apps/web/src/app/api/assistant/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/assistant/route.ts:1): OpenAI-backed rule generation endpoint with structured output
+- [`apps/web/prisma/schema.prisma`](/Users/Henry/Developer/vibe-pilot/apps/web/prisma/schema.prisma:1): Postgres schema for saved named rules
+- [`apps/extension/scripts/build-extension.mjs`](/Users/Henry/Developer/vibe-pilot/apps/extension/scripts/build-extension.mjs:1): unpacked extension build, generated runtime config, and hot-reload watcher
+- [`apps/extension/src/default-draft.js`](/Users/Henry/Developer/vibe-pilot/apps/extension/src/default-draft.js:1): default Hello world sample rule shared by the UI and runtime
 - [`apps/extension/src/service-worker.js`](/Users/Henry/Developer/vibe-pilot/apps/extension/src/service-worker.js:1): extension orchestration, local storage, remote save/load
 - [`apps/extension/src/sidepanel.js`](/Users/Henry/Developer/vibe-pilot/apps/extension/src/sidepanel.js:1): extension UI logic
 
@@ -92,4 +112,4 @@ On Railway you still need to:
 2. Add a PostgreSQL service.
 3. In the web service, add a reference variable for `DATABASE_URL` from the Postgres service.
 4. Generate a public domain for the web service.
-5. Put that public URL into the extension side panel as the backend URL when you want remote draft saves outside local development.
+5. Put that public app URL in `apps/extension/.env` as `VIBE_PILOT_BACKEND_URL` if you want your unpacked extension to talk to production by default.

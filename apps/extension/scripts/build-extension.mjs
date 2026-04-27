@@ -1,4 +1,4 @@
-import { watch } from "node:fs";
+import { readFileSync, watch } from "node:fs";
 import { cp, mkdir, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -8,19 +8,24 @@ const sourceDir = path.join(appDir, "src");
 const distDir = path.join(appDir, "dist");
 const watchMode = process.argv.includes("--watch");
 const hotReloadClients = new Set();
+const localEnv = loadEnvFile(path.join(appDir, ".env"));
+const env = {
+  ...localEnv,
+  ...process.env,
+};
 
-const webPort = normalizePort(process.env.PORT ?? process.env.VIBE_PILOT_WEB_PORT, 3001);
+const webPort = normalizePort(env.PORT ?? env.VIBE_PILOT_WEB_PORT, 3001);
 const hotReloadPort = normalizePort(
-  process.env.VIBE_PILOT_EXTENSION_HOT_RELOAD_PORT,
+  env.VIBE_PILOT_EXTENSION_HOT_RELOAD_PORT,
   35729,
 );
 const backendUrl =
-  process.env.VIBE_PILOT_BACKEND_URL ??
+  env.VIBE_PILOT_BACKEND_URL ??
   (watchMode
     ? `http://127.0.0.1:${webPort}`
     : "https://vibe-pilotweb-production.up.railway.app");
 const hotReloadUrl =
-  process.env.VIBE_PILOT_EXTENSION_HOT_RELOAD_URL ??
+  env.VIBE_PILOT_EXTENSION_HOT_RELOAD_URL ??
   `http://127.0.0.1:${hotReloadPort}`;
 
 let buildVersion = 0;
@@ -196,4 +201,42 @@ function normalizePort(value, fallback) {
   }
 
   return parsed;
+}
+
+function loadEnvFile(filePath) {
+  try {
+    const contents = readFileSync(filePath, "utf8");
+    const entries = {};
+
+    for (const rawLine of contents.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+
+      const separatorIndex = line.indexOf("=");
+      if (separatorIndex < 0) {
+        continue;
+      }
+
+      const key = line.slice(0, separatorIndex).trim();
+      if (!key) {
+        continue;
+      }
+
+      let value = line.slice(separatorIndex + 1).trim();
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+
+      entries[key] = value;
+    }
+
+    return entries;
+  } catch {
+    return {};
+  }
 }
