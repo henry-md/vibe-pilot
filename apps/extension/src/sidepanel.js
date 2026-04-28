@@ -706,6 +706,7 @@ async function cancelCurrentFlow() {
   clearChat();
   await persistCurrentFileNames();
   await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
+  switchView("rules");
 }
 
 async function leaveSavedRule() {
@@ -2007,22 +2008,14 @@ function renderAssistantTurn(message, toolMessages) {
 }
 
 function renderChatMessage(message, options = {}) {
-  const metaBits = [];
-  const label =
-    message.role === "user"
-      ? "You"
-      : message.role === "tool"
-        ? formatToolLabel(message.toolName) || "Tool"
-        : "Vibe Pilot";
-
-  metaBits.push(`<span>${escapeHtml(label)}</span>`);
+  const metaPills = [];
 
   if (message.role === "assistant" && message.status === "streaming") {
-    metaBits.push('<span class="chat-meta-pill chat-meta-pill-running">Streaming</span>');
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-running">Streaming</span>');
   }
 
   if (message.role === "tool") {
-    metaBits.push(...renderToolMetaPills(message));
+    metaPills.push(...renderToolMetaPills(message));
   }
 
   const useCompactImages = Boolean(options.compactImages || message.role === "user");
@@ -2032,16 +2025,18 @@ function renderChatMessage(message, options = {}) {
       })
     : "";
   const messageRole = message.role === "user" ? "user" : "assistant";
-  const avatarText = messageRole === "user" ? "ME" : "AI";
   const toolMarkup = typeof options.toolMarkup === "string" ? options.toolMarkup : "";
   const argumentsMarkup =
     message.role === "tool" ? renderToolArguments(message.toolArgumentsText) : "";
+  const metaMarkup =
+    metaPills.length > 0
+      ? `<div class="chat-message-meta">${metaPills.join("")}</div>`
+      : "";
 
   return `
     <section class="chat-row chat-row-${messageRole}">
-      <span class="chat-avatar chat-avatar-${messageRole}">${escapeHtml(avatarText)}</span>
       <article class="chat-message chat-message-${escapeHtml(message.role)}">
-        <div class="chat-message-meta">${metaBits.join("")}</div>
+        ${metaMarkup}
         ${message.text ? `<p class="chat-message-text">${formatMultilineText(message.text)}</p>` : ""}
         ${imagesMarkup ? `<div class="chat-image-grid${
           useCompactImages ? " chat-image-grid-compact" : ""
@@ -2115,11 +2110,7 @@ function renderToolGroup(messages, options = {}) {
 function renderToolThread(messages) {
   return `
     <section class="chat-row chat-row-assistant">
-      <span class="chat-avatar chat-avatar-assistant">AI</span>
       <article class="chat-message chat-message-assistant">
-        <div class="chat-message-meta">
-          <span>Vibe Pilot</span>
-        </div>
         ${renderToolGroup(messages, {
           nested: true,
         })}

@@ -70,6 +70,11 @@ body.surface-sidepanel .shell {
   overflow: hidden;
 }
 
+.shell > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
 body.surface-debug .shell {
   max-width: 1140px;
   padding: 24px 22px 22px;
@@ -726,10 +731,6 @@ body.surface-sidepanel #chat-input {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--foreground-soft);
-}
-
-.chat-row-user .chat-message-meta {
-  justify-content: flex-end;
 }
 
 .chat-meta-pill {
@@ -1599,6 +1600,11 @@ body.surface-sidepanel .chat-panel {
   border-color: rgba(190, 61, 32, 0.22);
   background: rgba(242, 92, 54, 0.1);
   color: #8f2710;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .surface-sidepanel.is-busy,
