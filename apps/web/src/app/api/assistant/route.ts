@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import type { Response as OpenAIResponse } from "openai/resources/responses/responses";
 import { NextRequest, NextResponse } from "next/server";
 import {
   shouldStoreAssistantResponses,
@@ -9,6 +10,8 @@ import {
   vibePilotAssistantRequestSchema,
   vibePilotAssistantResponseSchema,
 } from "@/lib/vibe-pilot-assistant";
+
+export const dynamic = "force-dynamic";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -79,16 +82,117 @@ function logAssistantDebug(message: string, details: unknown) {
   );
 }
 
+function buildAssistantCreateParams(
+  requestData: VibePilotAssistantRequest,
+) {
+  return {
+    model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+    store: shouldStoreAssistantResponses(),
+    instructions: VIBE_PILOT_SYSTEM_PROMPT,
+    input: requestData.input as never,
+    previous_response_id: requestData.previousResponseId ?? undefined,
+    parallel_tool_calls: false,
+    max_output_tokens: 2500,
+    tools: [...VIBE_PILOT_RESPONSE_TOOLS],
+  };
+}
+
+function getAssistantOutputText(response: OpenAIResponse) {
+  if (response.output_text) {
+    return response.output_text;
+  }
+
+  return response.output
+    .flatMap((item) => {
+      if (item.type !== "message" || item.role !== "assistant") {
+        return [];
+      }
+
+      return item.content;
+    })
+    .map((part) => {
+      if (part.type === "output_text") {
+        return part.text;
+      }
+
+      if (part.type === "refusal") {
+        return part.refusal;
+      }
+
+      return "";
+    })
+    .join("");
+}
+
+function buildAssistantResult(response: OpenAIResponse) {
+  return vibePilotAssistantResponseSchema.parse({
+    responseId: response.id,
+    assistantText: getAssistantOutputText(response),
+    functionCalls: response.output
+      .filter((item) => item.type === "function_call")
+      .map((item) => ({
+        callId: item.call_id,
+        name: item.name,
+        argumentsText: item.arguments,
+        arguments: tryParseAssistantToolArguments(item.arguments),
+      })),
+  });
+}
+
+function logAssistantResponse(
+  startedAt: number,
+  response: OpenAIResponse,
+) {
+  const outputText = getAssistantOutputText(response);
+
+  logAssistantDebug("response", {
+    elapsedMs: Date.now() - startedAt,
+    functionCalls: response.output
+      .filter((item) => item.type === "function_call")
+      .map((item) => ({
+        callId: item.call_id,
+        name: item.name,
+      })),
+    outputTypes: response.output.map((item) => item.type),
+    responseId: response.id,
+    textLength: outputText.length,
+  });
+}
+
+function formatAssistantError(error: unknown) {
+  return error instanceof Error
+    ? error.message
+    : "OpenAI failed to generate an assistant response.";
+}
+
+function jsonError(body: unknown, status: number) {
+  return NextResponse.json(body, {
+    status,
+    headers: CORS_HEADERS,
+  });
+}
+
+function wantsEventStream(request: NextRequest) {
+  const accept = request.headers.get("accept") ?? "";
+  const explicitPreference = request.headers.get("x-vibe-pilot-stream") ?? "";
+
+  return (
+    accept.toLowerCase().includes("text/event-stream") ||
+    explicitPreference.trim() === "1"
+  );
+}
+
+function createSseEvent(event: string, payload: unknown) {
+  return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+}
+
 export async function POST(request: NextRequest) {
   if (!process.env.OPENAI_API_KEY) {
-    return NextResponse.json(
+    return jsonError(
       {
         error: "OPENAI_API_KEY is not configured on the web backend.",
       },
-      {
-        status: 500,
-        headers: CORS_HEADERS,
-      },
+      500,
     );
   }
 
@@ -97,95 +201,106 @@ export async function POST(request: NextRequest) {
   try {
     payload = await request.json();
   } catch {
-    return NextResponse.json(
+    return jsonError(
       {
         error: "Request body must be valid JSON.",
       },
-      {
-        status: 400,
-        headers: CORS_HEADERS,
-      },
+      400,
     );
   }
 
   const parsedRequest = vibePilotAssistantRequestSchema.safeParse(payload);
   if (!parsedRequest.success) {
-    return NextResponse.json(
+    return jsonError(
       {
         error: "Assistant request payload was invalid.",
         details: parsedRequest.error.flatten(),
       },
-      {
-        status: 400,
-        headers: CORS_HEADERS,
-      },
+      400,
     );
   }
 
   const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
   });
+  const startedAt = Date.now();
+
+  logAssistantDebug("request", {
+    input: summarizeAssistantInput(parsedRequest.data.input),
+    previousResponseId: parsedRequest.data.previousResponseId ?? null,
+  });
+
+  if (wantsEventStream(request)) {
+    const encoder = new TextEncoder();
+    const stream = openai.responses.stream(
+      buildAssistantCreateParams(parsedRequest.data),
+      {
+        signal: request.signal,
+      },
+    );
+
+    const responseStream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const send = (event: string, data: unknown) => {
+          controller.enqueue(encoder.encode(createSseEvent(event, data)));
+        };
+
+        stream.on("response.output_text.delta", (event) => {
+          if (!event.delta) {
+            return;
+          }
+
+          send("assistant.text_delta", {
+            delta: event.delta,
+          });
+        });
+
+        try {
+          const finalResponse = await stream.finalResponse();
+          logAssistantResponse(startedAt, finalResponse);
+          send("assistant.response", buildAssistantResult(finalResponse));
+        } catch (error) {
+          send("assistant.error", {
+            error: formatAssistantError(error),
+          });
+        } finally {
+          controller.close();
+        }
+      },
+      cancel() {
+        stream.abort();
+      },
+    });
+
+    return new Response(responseStream, {
+      headers: {
+        ...CORS_HEADERS,
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "Content-Type": "text/event-stream; charset=utf-8",
+      },
+    });
+  }
 
   try {
-    const startedAt = Date.now();
-    logAssistantDebug("request", {
-      input: summarizeAssistantInput(parsedRequest.data.input),
-      previousResponseId: parsedRequest.data.previousResponseId ?? null,
-    });
+    const response = await openai.responses.create(
+      buildAssistantCreateParams(parsedRequest.data),
+      {
+        signal: request.signal,
+      },
+    );
 
-    const response = await openai.responses.create({
-      model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
-      store: shouldStoreAssistantResponses(),
-      instructions: VIBE_PILOT_SYSTEM_PROMPT,
-      // The request body is validated with Zod before this cast.
-      input: parsedRequest.data.input as never,
-      previous_response_id: parsedRequest.data.previousResponseId ?? undefined,
-      parallel_tool_calls: false,
-      max_output_tokens: 2500,
-      tools: [...VIBE_PILOT_RESPONSE_TOOLS],
-    });
+    logAssistantResponse(startedAt, response);
 
-    logAssistantDebug("response", {
-      elapsedMs: Date.now() - startedAt,
-      functionCalls: response.output
-        .filter((item) => item.type === "function_call")
-        .map((item) => ({
-          callId: item.call_id,
-          name: item.name,
-        })),
-      outputTypes: response.output.map((item) => item.type),
-      responseId: response.id,
-      textLength: response.output_text.length,
-    });
-
-    const result = vibePilotAssistantResponseSchema.parse({
-      responseId: response.id,
-      assistantText: response.output_text ?? "",
-      functionCalls: response.output
-        .filter((item) => item.type === "function_call")
-        .map((item) => ({
-          callId: item.call_id,
-          name: item.name,
-          argumentsText: item.arguments,
-          arguments: tryParseAssistantToolArguments(item.arguments),
-        })),
-    });
-
-    return NextResponse.json(result, {
+    return NextResponse.json(buildAssistantResult(response), {
       headers: CORS_HEADERS,
     });
   } catch (error) {
-    return NextResponse.json(
+    return jsonError(
       {
-        error:
-          error instanceof Error
-            ? error.message
-            : "OpenAI failed to generate an assistant response.",
+        error: formatAssistantError(error),
       },
-      {
-        status: 500,
-        headers: CORS_HEADERS,
-      },
+      500,
     );
   }
 }

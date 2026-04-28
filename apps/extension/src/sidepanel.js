@@ -6,6 +6,7 @@ import {
   RED_TEXT_STARTER_WORKSPACE_RULE,
 } from "./default-draft.js";
 
+const ASSISTANT_PROGRESS_PORT_NAME = "vibe-pilot-assistant-progress";
 const FILE_DEFINITIONS = [
   {
     key: "html",
@@ -39,6 +40,7 @@ const FILE_LAYOUT_STORAGE_KEY = "vibePilotFileLayout";
 const state = {
   activeFile: "html",
   assistantMessages: [],
+  assistantProgressPort: null,
   assistantPreviousResponseId: null,
   activeTab: null,
   activeView: "create",
@@ -110,6 +112,7 @@ boot();
 async function boot() {
   state.fileLayout = await loadFileLayout();
   wireEvents();
+  connectAssistantProgressPort();
   setCurrentFileNames(resolveFileNamesForRuleId(null));
   switchActiveFile(state.activeFile);
   switchView("create");
@@ -537,6 +540,42 @@ async function sendMessage(type, payload) {
   }
 
   return response.payload;
+}
+
+function connectAssistantProgressPort() {
+  if (state.assistantProgressPort || !chrome.runtime?.connect) {
+    return;
+  }
+
+  const port = chrome.runtime.connect({
+    name: ASSISTANT_PROGRESS_PORT_NAME,
+  });
+
+  state.assistantProgressPort = port;
+
+  port.onMessage.addListener((message) => {
+    handleAssistantProgressMessage(message);
+  });
+
+  port.onDisconnect.addListener(() => {
+    if (state.assistantProgressPort === port) {
+      state.assistantProgressPort = null;
+    }
+
+    if (!state.hotReloading) {
+      window.setTimeout(() => {
+        connectAssistantProgressPort();
+      }, 250);
+    }
+  });
+}
+
+function handleAssistantProgressMessage(message) {
+  if (message?.type !== "assistant-message-upsert") {
+    return;
+  }
+
+  appendAssistantMessages([message.message]);
 }
 
 function wireHotReload() {
@@ -969,7 +1008,33 @@ function resetAssistantConversation() {
 }
 
 function appendAssistantMessages(messages) {
-  state.assistantMessages.push(...messages);
+  const normalizedMessages = normalizeAssistantMessages(messages);
+
+  if (!normalizedMessages.length) {
+    return;
+  }
+
+  normalizedMessages.forEach((message) => {
+    const existingIndex = state.assistantMessages.findIndex(
+      (candidate) => candidate.id === message.id,
+    );
+
+    if (existingIndex < 0) {
+      state.assistantMessages.push(message);
+      return;
+    }
+
+    const existingMessage = state.assistantMessages[existingIndex];
+    state.assistantMessages[existingIndex] = {
+      ...existingMessage,
+      ...message,
+      createdAt:
+        typeof existingMessage?.createdAt === "string" && existingMessage.createdAt.trim()
+          ? existingMessage.createdAt
+          : message.createdAt,
+    };
+  });
+
   renderChatMessages();
 }
 
@@ -999,7 +1064,10 @@ function normalizeAssistantMessages(messages) {
               url: image.url,
             }))
         : [],
-      role: message?.role === "assistant" || message?.role === "tool"
+      role:
+        message?.role === "assistant" ||
+        message?.role === "tool" ||
+        message?.role === "user"
         ? message.role
         : "assistant",
       status:
@@ -1007,6 +1075,10 @@ function normalizeAssistantMessages(messages) {
           ? message.status.trim()
           : "ok",
       text: typeof message?.text === "string" ? message.text : "",
+      toolArgumentsText:
+        typeof message?.toolArgumentsText === "string"
+          ? message.toolArgumentsText
+          : "",
       toolName:
         typeof message?.toolName === "string" && message.toolName.trim()
           ? message.toolName.trim()
@@ -1017,12 +1089,22 @@ function normalizeAssistantMessages(messages) {
 
 function createAssistantMessage(role, text, options = {}) {
   return {
-    createdAt: new Date().toISOString(),
-    id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    createdAt:
+      typeof options.createdAt === "string" && options.createdAt.trim()
+        ? options.createdAt.trim()
+        : new Date().toISOString(),
+    id:
+      typeof options.id === "string" && options.id.trim()
+        ? options.id.trim()
+        : `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     images: Array.isArray(options.images) ? options.images : [],
     role,
     status: options.status ?? "ok",
     text,
+    toolArgumentsText:
+      typeof options.toolArgumentsText === "string"
+        ? options.toolArgumentsText
+        : "",
     toolName: options.toolName ?? null,
   };
 }

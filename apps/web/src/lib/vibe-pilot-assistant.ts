@@ -330,9 +330,11 @@ Your job is not always to edit code.
 
 When the user does want page changes:
 - Inspect first. Use page context, DOM queries, and screenshots before making edits.
+- Take a baseline screenshot before visual edits whenever the current appearance matters.
 - Make the smallest draft change that can satisfy the request.
-- If the request is visual or layout-sensitive, apply the draft and inspect again with at least one screenshot before you declare success.
-- Keep iterating until the result appears correct or you hit a concrete blocker.
+- If the request changes anything visible, including layout, styling, spacing, imagery, or copy, you must apply the draft, take a fresh screenshot, and use that screenshot as the verification artifact before you declare success.
+- If the verification screenshot does not clearly show the requested result, keep iterating: inspect again, adjust the draft, re-apply it, and take another screenshot.
+- Keep iterating until the result appears correct in the screenshot or you hit a concrete blocker.
 - Use page reloads when the user asks you to verify persistence after refresh.
 
 Draft authoring rules:

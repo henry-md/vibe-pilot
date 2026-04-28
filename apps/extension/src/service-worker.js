@@ -6,6 +6,7 @@ import {
 } from "./default-draft.js";
 
 const ACTIVE_SCRIPT_ID = "vibe-pilot-live-script";
+const ASSISTANT_PROGRESS_PORT_NAME = "vibe-pilot-assistant-progress";
 const LOCAL_BACKEND_URL = "http://127.0.0.1:3001";
 const OVERLAY_HOST_ID = "__vibe_pilot_host__";
 const OVERLAY_ROOT_ID = "__vibe_pilot_root__";
@@ -26,6 +27,7 @@ const STORAGE_KEYS = {
   pendingHotReloadTabId: "vibePilotPendingHotReloadTabId",
 };
 
+const assistantProgressPorts = new Set();
 let lastScreenshotCapturedAt = 0;
 
 chrome.runtime.onInstalled.addListener((details) => {
@@ -56,6 +58,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     });
 
   return true;
+});
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== ASSISTANT_PROGRESS_PORT_NAME) {
+    return;
+  }
+
+  assistantProgressPorts.add(port);
+
+  port.onDisconnect.addListener(() => {
+    assistantProgressPorts.delete(port);
+  });
 });
 
 async function bootstrap(reason) {
@@ -1064,15 +1078,39 @@ async function runAssistantTurn(payload) {
   }
 
   const messages = [];
+  let assistantResponseCount = 0;
+  const publishMessage = (message) => {
+    const nextMessage = upsertTranscriptMessage(messages, message);
+    broadcastAssistantProgress({
+      message: nextMessage,
+      type: "assistant-message-upsert",
+    });
+    return nextMessage;
+  };
+  const createAssistantMessageId = () => {
+    assistantResponseCount += 1;
+    return createTranscriptMessageId(`assistant-${assistantResponseCount}`);
+  };
+
+  let emptyResponseRetryCount = 0;
+  let assistantMessageId = createAssistantMessageId();
   let response = await requestAssistantResponse({
     input: [buildAssistantUserInput(prompt)],
     previousResponseId,
+  }, {
+    assistantMessageId,
+    onAssistantMessage: publishMessage,
   });
-  let emptyResponseRetryCount = 0;
   ({
+    assistantMessageId,
     response,
     retryCount: emptyResponseRetryCount,
-  } = await recoverEmptyAssistantResponse(response, emptyResponseRetryCount));
+  } = await recoverEmptyAssistantResponse(response, emptyResponseRetryCount, {
+    assistantMessageId,
+    createAssistantMessageId,
+    onAssistantMessage: publishMessage,
+  }));
+  publishFinalAssistantMessage(response, assistantMessageId, publishMessage);
   let toolStepCount = 0;
 
   while (response.functionCalls.length > 0) {
@@ -1093,26 +1131,51 @@ async function runAssistantTurn(payload) {
     const toolOutputs = [];
 
     for (const call of response.functionCalls) {
-      const execution = await executeAssistantToolCall(call);
+      const toolMessageId = createAssistantToolMessageId(call.callId);
+      publishMessage(
+        createTranscriptMessage(
+          "tool",
+          buildPendingToolTranscriptText(call.name),
+          {
+            id: toolMessageId,
+            status: "running",
+            toolArgumentsText: call.argumentsText,
+            toolName: call.name,
+          },
+        ),
+      );
+
+      const execution = await executeAssistantToolCall(call, {
+        messageId: toolMessageId,
+      });
       toolOutputs.push(execution.outputItem);
-      messages.push(...execution.messages);
+      execution.messages.forEach((message) => {
+        publishMessage(message);
+      });
     }
 
+    assistantMessageId = createAssistantMessageId();
     response = await requestAssistantResponse({
       input: toolOutputs,
       previousResponseId: response.responseId,
+    }, {
+      assistantMessageId,
+      onAssistantMessage: publishMessage,
     });
     ({
+      assistantMessageId,
       response,
       retryCount: emptyResponseRetryCount,
-    } = await recoverEmptyAssistantResponse(response, emptyResponseRetryCount));
+    } = await recoverEmptyAssistantResponse(response, emptyResponseRetryCount, {
+      assistantMessageId,
+      createAssistantMessageId,
+      onAssistantMessage: publishMessage,
+    }));
+    publishFinalAssistantMessage(response, assistantMessageId, publishMessage);
   }
 
-  const assistantText = response.assistantText.trim();
-  if (assistantText) {
-    messages.push(createTranscriptMessage("assistant", assistantText));
-  } else if (!messages.length) {
-    messages.push(
+  if (!messages.length) {
+    publishMessage(
       createTranscriptMessage(
         "assistant",
         "I finished the request, but I did not receive a final text reply from the model.",
@@ -1129,9 +1192,13 @@ async function runAssistantTurn(payload) {
   };
 }
 
-async function recoverEmptyAssistantResponse(response, retryCount) {
+async function recoverEmptyAssistantResponse(response, retryCount, options = {}) {
   let nextResponse = response;
   let nextRetryCount = retryCount;
+  let assistantMessageId =
+    typeof options.assistantMessageId === "string" && options.assistantMessageId.trim()
+      ? options.assistantMessageId.trim()
+      : createTranscriptMessageId("assistant-retry");
 
   while (
     nextRetryCount < ASSISTANT_EMPTY_RESPONSE_RETRY_LIMIT &&
@@ -1139,6 +1206,10 @@ async function recoverEmptyAssistantResponse(response, retryCount) {
     !nextResponse.assistantText.trim()
   ) {
     nextRetryCount += 1;
+    assistantMessageId =
+      typeof options.createAssistantMessageId === "function"
+        ? options.createAssistantMessageId()
+        : createTranscriptMessageId(`assistant-retry-${nextRetryCount}`);
     nextResponse = await requestAssistantResponse({
       input: [
         buildAssistantDeveloperInput(
@@ -1150,23 +1221,29 @@ async function recoverEmptyAssistantResponse(response, retryCount) {
         ),
       ],
       previousResponseId: nextResponse.responseId,
+    }, {
+      assistantMessageId,
+      onAssistantMessage: options.onAssistantMessage,
     });
   }
 
   return {
+    assistantMessageId,
     response: nextResponse,
     retryCount: nextRetryCount,
   };
 }
 
-async function requestAssistantResponse(payload) {
-  const response = await fetchAssistantJson("/api/assistant", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  }, {
+async function requestAssistantResponse(payload, options = {}) {
+  const response = await fetchAssistantResponsePayload("/api/assistant", payload, {
+    assistantMessageId:
+      typeof options.assistantMessageId === "string" && options.assistantMessageId.trim()
+        ? options.assistantMessageId.trim()
+        : createTranscriptMessageId("assistant"),
+    onAssistantMessage:
+      typeof options.onAssistantMessage === "function"
+        ? options.onAssistantMessage
+        : null,
     timeoutMs: ASSISTANT_BACKEND_TIMEOUT_MS,
   });
 
@@ -1181,7 +1258,7 @@ async function requestAssistantResponse(payload) {
   };
 }
 
-async function fetchAssistantJson(path, init, options = {}) {
+async function fetchAssistantResponsePayload(path, payload, options = {}) {
   const candidates = buildBackendCandidateUrls(path);
   let lastError = null;
 
@@ -1189,7 +1266,7 @@ async function fetchAssistantJson(path, init, options = {}) {
     const url = candidates[index];
 
     try {
-      return await fetchJson(url, init, options);
+      return await readAssistantResponse(url, payload, options);
     } catch (error) {
       lastError = error;
 
@@ -1215,6 +1292,195 @@ async function fetchAssistantJson(path, init, options = {}) {
   throw lastError instanceof Error
     ? lastError
     : new Error("The assistant backend request failed.");
+}
+
+async function readAssistantResponse(url, payload, options = {}) {
+  const timeoutMs =
+    typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
+      ? options.timeoutMs
+      : ASSISTANT_BACKEND_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort(new Error(`Timed out while waiting for ${url}.`));
+  }, timeoutMs);
+
+  let response;
+
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: {
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+        "X-Vibe-Pilot-Stream": "1",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (error) {
+    const wrapped = new Error(
+      `Unable to reach the backend at ${url}. ${
+        error instanceof Error ? error.message : "Unknown network error."
+      }`,
+    );
+    wrapped.backendUrl = url;
+    wrapped.cause = error instanceof Error ? error : undefined;
+    throw wrapped;
+  }
+
+  if (!response.ok) {
+    const details = await response.text();
+    const wrapped = new Error(
+      details || `Backend request failed with status ${response.status}.`,
+    );
+    wrapped.backendDetails = details;
+    wrapped.backendStatus = response.status;
+    wrapped.backendUrl = url;
+    throw wrapped;
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+
+  try {
+    if (
+      !contentType.toLowerCase().includes("text/event-stream") ||
+      !response.body
+    ) {
+      return await response.json();
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const assistantMessageId =
+      typeof options.assistantMessageId === "string" && options.assistantMessageId.trim()
+        ? options.assistantMessageId.trim()
+        : createTranscriptMessageId("assistant");
+    let assistantText = "";
+    let buffer = "";
+    let finalPayload = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += decoder.decode(value ?? new Uint8Array(), {
+        stream: !done,
+      });
+      const events = extractSseEvents(buffer);
+      buffer = events.remainder;
+
+      for (const event of events.items) {
+        if (event.type === "assistant.text_delta") {
+          const delta =
+            typeof event.data?.delta === "string" ? event.data.delta : "";
+
+          if (!delta) {
+            continue;
+          }
+
+          assistantText += delta;
+          if (typeof options.onAssistantMessage === "function") {
+            options.onAssistantMessage(
+              createTranscriptMessage("assistant", assistantText, {
+                id: assistantMessageId,
+                status: "streaming",
+              }),
+            );
+          }
+          continue;
+        }
+
+        if (event.type === "assistant.response") {
+          finalPayload = event.data;
+          continue;
+        }
+
+        if (event.type === "assistant.error") {
+          throw new Error(
+            typeof event.data?.error === "string" && event.data.error.trim()
+              ? event.data.error.trim()
+              : "The assistant stream reported an unknown error.",
+          );
+        }
+      }
+
+      if (done) {
+        break;
+      }
+    }
+
+    const trailingEvent = parseSseEvent(buffer);
+    if (trailingEvent) {
+      if (trailingEvent.type === "assistant.response") {
+        finalPayload = trailingEvent.data;
+      } else if (trailingEvent.type === "assistant.error") {
+        throw new Error(
+          typeof trailingEvent.data?.error === "string" &&
+            trailingEvent.data.error.trim()
+            ? trailingEvent.data.error.trim()
+            : "The assistant stream reported an unknown error.",
+        );
+      }
+    }
+
+    if (!finalPayload) {
+      throw new Error(
+        "The assistant stream ended before it returned a final response payload.",
+      );
+    }
+
+    return finalPayload;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function extractSseEvents(buffer) {
+  const chunks = buffer.split(/\r?\n\r?\n/);
+  const remainder = chunks.pop() ?? "";
+
+  return {
+    items: chunks
+      .map((chunk) => parseSseEvent(chunk))
+      .filter(Boolean),
+    remainder,
+  };
+}
+
+function parseSseEvent(chunk) {
+  if (typeof chunk !== "string" || !chunk.trim()) {
+    return null;
+  }
+
+  const lines = chunk.split(/\r?\n/);
+  const dataLines = [];
+  let type = "message";
+
+  for (const line of lines) {
+    if (!line || line.startsWith(":")) {
+      continue;
+    }
+
+    if (line.startsWith("event:")) {
+      type = line.slice("event:".length).trim() || "message";
+      continue;
+    }
+
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  if (!dataLines.length) {
+    return null;
+  }
+
+  try {
+    return {
+      data: JSON.parse(dataLines.join("\n")),
+      type,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function buildBackendCandidateUrls(path) {
@@ -1259,6 +1525,22 @@ function isLocalBackendUrl(value) {
   }
 }
 
+function publishFinalAssistantMessage(response, messageId, publishMessage) {
+  const assistantText =
+    typeof response?.assistantText === "string" ? response.assistantText.trim() : "";
+
+  if (!assistantText) {
+    return;
+  }
+
+  publishMessage(
+    createTranscriptMessage("assistant", assistantText, {
+      id: messageId,
+      status: "ok",
+    }),
+  );
+}
+
 function buildAssistantUserInput(prompt) {
   return {
     type: "message",
@@ -1285,13 +1567,19 @@ function buildAssistantDeveloperInput(text) {
   };
 }
 
-async function executeAssistantToolCall(call) {
+async function executeAssistantToolCall(call, options = {}) {
   const toolName =
     typeof call?.name === "string" && call.name.trim() ? call.name.trim() : "";
   const callId =
     typeof call?.callId === "string" && call.callId.trim() ? call.callId.trim() : "";
   const rawArguments =
     isRecord(call?.arguments) ? call.arguments : parseToolArguments(call?.argumentsText);
+  const toolArgumentsText =
+    typeof call?.argumentsText === "string" ? call.argumentsText : "";
+  const messageId =
+    typeof options.messageId === "string" && options.messageId.trim()
+      ? options.messageId.trim()
+      : createAssistantToolMessageId(callId || toolName || "tool");
 
   if (!toolName || !callId) {
     return {
@@ -1305,7 +1593,9 @@ async function executeAssistantToolCall(call) {
           "tool",
           "A malformed tool call was skipped because it was missing a name or id.",
           {
+            id: messageId,
             status: "error",
+            toolArgumentsText,
             toolName: toolName || "unknown",
           },
         ),
@@ -1326,7 +1616,9 @@ async function executeAssistantToolCall(call) {
           "tool",
           `The runtime could not find the "${toolName}" tool.`,
           {
+            id: messageId,
             status: "error",
+            toolArgumentsText,
             toolName,
           },
         ),
@@ -1345,8 +1637,10 @@ async function executeAssistantToolCall(call) {
       },
       messages: [
         createTranscriptMessage("tool", execution.transcriptText, {
+          id: messageId,
           images: execution.images ?? [],
           status: execution.status ?? "ok",
+          toolArgumentsText,
           toolName,
         }),
       ],
@@ -1363,7 +1657,9 @@ async function executeAssistantToolCall(call) {
       },
       messages: [
         createTranscriptMessage("tool", message, {
+          id: messageId,
           status: "error",
+          toolArgumentsText,
           toolName,
         }),
       ],
@@ -1856,14 +2152,96 @@ async function getActiveTabInWindow(windowId) {
   return tabs[0] ?? null;
 }
 
+function broadcastAssistantProgress(message) {
+  for (const port of Array.from(assistantProgressPorts)) {
+    try {
+      port.postMessage(message);
+    } catch (error) {
+      console.warn("Unable to deliver assistant progress to a port.", error);
+      assistantProgressPorts.delete(port);
+    }
+  }
+}
+
+function upsertTranscriptMessage(messages, nextMessage) {
+  const nextId =
+    typeof nextMessage?.id === "string" && nextMessage.id.trim()
+      ? nextMessage.id.trim()
+      : createTranscriptMessageId(nextMessage?.role ?? "assistant");
+  const normalizedMessage = {
+    ...nextMessage,
+    id: nextId,
+  };
+  const existingIndex = messages.findIndex((message) => message.id === nextId);
+
+  if (existingIndex < 0) {
+    messages.push(normalizedMessage);
+    return normalizedMessage;
+  }
+
+  const existingMessage = messages[existingIndex];
+  const mergedMessage = {
+    ...existingMessage,
+    ...normalizedMessage,
+    createdAt:
+      typeof existingMessage?.createdAt === "string" && existingMessage.createdAt.trim()
+        ? existingMessage.createdAt
+        : normalizedMessage.createdAt,
+  };
+
+  messages[existingIndex] = mergedMessage;
+  return mergedMessage;
+}
+
+function createTranscriptMessageId(prefix = "message") {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function createAssistantToolMessageId(callId) {
+  const normalizedCallId =
+    typeof callId === "string" && callId.trim() ? callId.trim() : "tool";
+
+  return `tool-${normalizedCallId}`;
+}
+
+function buildPendingToolTranscriptText(toolName) {
+  const label = formatAssistantToolLabel(toolName) || "Tool";
+  return `Running ${label}...`;
+}
+
+function formatAssistantToolLabel(value) {
+  const normalized =
+    typeof value === "string" && value.trim() ? value.trim() : "";
+
+  if (!normalized) {
+    return "";
+  }
+
+  return normalized
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
 function createTranscriptMessage(role, text, options = {}) {
   return {
-    createdAt: new Date().toISOString(),
-    id: `${role}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    createdAt:
+      typeof options.createdAt === "string" && options.createdAt.trim()
+        ? options.createdAt.trim()
+        : new Date().toISOString(),
+    id:
+      typeof options.id === "string" && options.id.trim()
+        ? options.id.trim()
+        : createTranscriptMessageId(role),
     images: Array.isArray(options.images) ? options.images : [],
     role,
     status: options.status ?? "ok",
     text,
+    toolArgumentsText:
+      typeof options.toolArgumentsText === "string"
+        ? options.toolArgumentsText
+        : "",
     toolName: options.toolName ?? null,
   };
 }
