@@ -26,6 +26,7 @@ export const DEFAULT_DRAFT = {
     "}",
   ].join("\n"),
   javascript: "",
+  files: [],
 };
 
 export const DEFAULT_RULE_NAME = "Hello world pill";
@@ -36,11 +37,34 @@ export const DEFAULT_WORKSPACE_RULE = {
   ...DEFAULT_DRAFT,
 };
 
+export const RED_TEXT_STARTER_RULE_NAME = "Red text override";
+
+export const RED_TEXT_STARTER_DRAFT = {
+  matchPattern: "*://*/*",
+  html: "",
+  css: [
+    "html,",
+    "body,",
+    "body * {",
+    "  color: #d11a2a !important;",
+    "}",
+  ].join("\n"),
+  javascript: "",
+  files: [],
+};
+
+export const RED_TEXT_STARTER_WORKSPACE_RULE = {
+  id: null,
+  name: RED_TEXT_STARTER_RULE_NAME,
+  ...RED_TEXT_STARTER_DRAFT,
+};
+
 export const EMPTY_DRAFT = {
   matchPattern: DEFAULT_DRAFT.matchPattern,
   html: "",
   css: "",
   javascript: "",
+  files: [],
 };
 
 export const EMPTY_WORKSPACE_RULE = {

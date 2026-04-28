@@ -16,7 +16,6 @@ async function getDashboardSnapshot() {
         select: {
           id: true,
           name: true,
-          targetUrl: true,
           matchPattern: true,
           updatedAt: true,
         },
@@ -53,8 +52,9 @@ export default async function Home() {
           <h1>Vibe Pilot web app and backend</h1>
           <p className={styles.lead}>
             This Next.js app is now the real backend surface for the extension.
-            It owns Prisma, Postgres, Railway deploys, and the first persistence
-            API for named DOM-edit rules.
+            It owns Prisma, Postgres, Railway deploys, named rule persistence,
+            and the OpenAI loop that lets Vibe Pilot inspect a page, capture
+            screenshots, and iterate on edits inside one prompt.
           </p>
         </div>
         <div className={styles.heroCard}>
@@ -70,6 +70,7 @@ export default async function Home() {
           <h2>What lives here</h2>
           <ul className={styles.list}>
             <li>API routes for saving, updating, listing, and deleting rules</li>
+            <li>OpenAI assistant orchestration for tool-driven page editing</li>
             <li>Prisma client and Postgres schema ownership</li>
             <li>Railway deployment target for production</li>
           </ul>
@@ -80,8 +81,8 @@ export default async function Home() {
           <h2>What stays in Chrome</h2>
           <ul className={styles.list}>
             <li>Side panel chat and page-edit UI</li>
-            <li>Content script DOM inspection</li>
-            <li>Live rule registration and page injection</li>
+            <li>Content script DOM inspection and scrolling tools</li>
+            <li>Live rule registration, screenshots, and page injection</li>
           </ul>
         </article>
 
@@ -124,7 +125,10 @@ export default async function Home() {
             </div>
             <div className={styles.endpoint}>
               <code>POST /api/assistant</code>
-              <p>Turns a chat prompt plus page context into a structured DOM-edit rule.</p>
+              <p>
+                Runs the Vibe Pilot assistant loop so the extension can inspect the
+                page, call local tools, and continue until it has an answer or edit.
+              </p>
             </div>
           </div>
         </article>
@@ -141,7 +145,7 @@ export default async function Home() {
               {snapshot.latestRules.map((rule) => (
                 <div className={styles.draftCard} key={rule.id}>
                   <strong>{rule.name}</strong>
-                  <p>{rule.targetUrl ?? rule.matchPattern}</p>
+                  <p>{rule.matchPattern}</p>
                   <span>
                     updated{" "}
                     {new Intl.DateTimeFormat("en-US", {

@@ -30,6 +30,7 @@ Add your OpenAI key in `apps/web/.env`:
 ```bash
 OPENAI_API_KEY="replace-with-openai-key"
 OPENAI_MODEL="gpt-5"
+OPENAI_STORE_RESPONSES="true"
 ```
 
 Start local Postgres:
@@ -75,6 +76,14 @@ Build a one-off unpacked extension bundle without the watcher:
 npm run build:extension
 ```
 
+## Extension Starter Rules
+
+The starter chips in the extension are intentionally constrained:
+
+- `Hello World Pill` is the only toy/demo starter.
+- Every other starter must load a concrete, useful rule. The current built-in example is `Make Text Red`, which forces text red with `!important`.
+- Starter labels must describe the action or outcome. Do not surface raw page titles, company names, or hostnames as chip text by themselves.
+
 Load it in Chrome:
 
 1. Open `chrome://extensions`.
@@ -91,7 +100,7 @@ Load it in Chrome:
 - [`apps/web/src/app/api/health/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/health/route.ts:1): health probe for Railway and local checks
 - [`apps/web/src/app/api/rules/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/rules/route.ts:1): named rule list/create API
 - [`apps/web/src/app/api/rules/[ruleId]/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/rules/[ruleId]/route.ts:1): named rule update/delete API
-- [`apps/web/src/app/api/assistant/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/assistant/route.ts:1): OpenAI-backed rule generation endpoint with structured output
+- [`apps/web/src/app/api/assistant/route.ts`](/Users/Henry/Developer/vibe-pilot/apps/web/src/app/api/assistant/route.ts:1): OpenAI-backed chat and tool-loop endpoint for DOM inspection, screenshots, and iterative rule editing
 - [`apps/web/prisma/schema.prisma`](/Users/Henry/Developer/vibe-pilot/apps/web/prisma/schema.prisma:1): Postgres schema for saved named rules
 - [`apps/extension/scripts/build-extension.mjs`](/Users/Henry/Developer/vibe-pilot/apps/extension/scripts/build-extension.mjs:1): unpacked extension build, generated runtime config, and hot-reload watcher
 - [`apps/extension/src/default-draft.js`](/Users/Henry/Developer/vibe-pilot/apps/extension/src/default-draft.js:1): default Hello world sample rule shared by the UI and runtime
