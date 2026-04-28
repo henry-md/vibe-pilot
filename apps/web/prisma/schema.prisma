@@ -15,6 +15,8 @@ model Rule {
   css          String   @default("") @db.Text
   javascript   String   @default("") @db.Text
   files        String   @default("[]") @db.Text
+  chatMessages String   @default("[]") @db.Text
+  chatPreviousResponseId String? @db.Text
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }

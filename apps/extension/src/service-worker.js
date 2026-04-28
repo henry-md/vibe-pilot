@@ -16,12 +16,16 @@ const RULE_BACKEND_TIMEOUT_MS = 8000;
 const ASSISTANT_BACKEND_TIMEOUT_MS = 120000;
 const ASSISTANT_MAX_TOOL_STEPS = 24;
 const ASSISTANT_EMPTY_RESPONSE_RETRY_LIMIT = 2;
+const CHAT_IMAGE_ATTACHMENT_LIMIT = 4;
 const SCREENSHOT_CAPTURE_COOLDOWN_MS = 550;
 const SCREENSHOT_PREVIEW_MAX_WIDTH = 960;
 const SCREENSHOT_PREVIEW_MAX_HEIGHT = 960;
 const SCREENSHOT_PREVIEW_QUALITY = 0.68;
+const FILE_LAYOUT_STORAGE_KEY = "vibePilotFileLayout";
+const PROJECT_STATE_RESET_VERSION = 2;
 const STORAGE_KEYS = {
   activeDraft: "vibePilotDraft",
+  projectsResetVersion: "vibePilotProjectsResetVersion",
   workspaceDraft: "vibePilotWorkspaceDraft",
   pendingHotReload: "vibePilotPendingHotReload",
   pendingHotReloadTabId: "vibePilotPendingHotReloadTabId",
@@ -35,8 +39,7 @@ chrome.runtime.onInstalled.addListener((details) => {
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void restoreRegisteredScript();
-  void finalizeHotReload();
+  void handleStartup();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -73,6 +76,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 async function bootstrap(reason) {
+  await resetProjectStateIfNeeded();
   await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
   await ensureDraftState();
 
@@ -80,6 +84,33 @@ async function bootstrap(reason) {
     await restoreRegisteredScript();
     await finalizeHotReload();
   }
+}
+
+async function handleStartup() {
+  await resetProjectStateIfNeeded();
+  await restoreRegisteredScript();
+  await finalizeHotReload();
+}
+
+async function resetProjectStateIfNeeded() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.projectsResetVersion);
+  const currentVersion = Number(stored[STORAGE_KEYS.projectsResetVersion] ?? 0);
+
+  if (currentVersion >= PROJECT_STATE_RESET_VERSION) {
+    return;
+  }
+
+  await clearRegisteredScript();
+  await chrome.storage.local.remove([
+    STORAGE_KEYS.activeDraft,
+    STORAGE_KEYS.workspaceDraft,
+    STORAGE_KEYS.pendingHotReload,
+    STORAGE_KEYS.pendingHotReloadTabId,
+    FILE_LAYOUT_STORAGE_KEY,
+  ]);
+  await chrome.storage.local.set({
+    [STORAGE_KEYS.projectsResetVersion]: PROJECT_STATE_RESET_VERSION,
+  });
 }
 
 async function handleMessage(message) {
@@ -104,6 +135,8 @@ async function handleMessage(message) {
       return runAssistantTurn(message.payload);
     case "VIBE_PILOT_LIST_RULES":
       return listRules();
+    case "VIBE_PILOT_GET_RULE":
+      return getRule(message.payload);
     case "VIBE_PILOT_DELETE_RULE":
       return deleteRule(message.payload);
     default:
@@ -137,12 +170,13 @@ async function saveDraft(payload) {
 
 async function saveRule(payload) {
   const draft = normalizeDraft(payload);
+  const persistedRule = normalizeRuleRecord(payload);
   if (!draft.name) {
     throw new Error("Give this rule a name before saving it.");
   }
 
-  const response = await persistRule(draft);
-  const savedRule = response.rule ? normalizeDraft(response.rule) : draft;
+  const response = await persistRule(persistedRule);
+  const savedRule = response.rule ? normalizeRuleRecord(response.rule) : persistedRule;
   await setWorkspaceDraft(savedRule);
 
   return {
@@ -154,6 +188,7 @@ async function saveRule(payload) {
 
 async function applyDraft(payload) {
   const draft = normalizeDraft(payload);
+  const persistedRule = normalizeRuleRecord(payload);
 
   if (!draft.name) {
     throw new Error("Give this rule a name before you apply it.");
@@ -170,8 +205,8 @@ async function applyDraft(payload) {
   let remoteSaved = false;
   let savedRule = null;
   try {
-    const response = await persistRule(draft);
-    savedRule = response.rule ? normalizeDraft(response.rule) : null;
+    const response = await persistRule(persistedRule);
+    savedRule = response.rule ? normalizeRuleRecord(response.rule) : null;
     if (savedRule) {
       await setActiveDraft(savedRule);
     }
@@ -206,8 +241,33 @@ async function listRules() {
     backendUrl: BACKEND_URL,
     ...response,
     rules: Array.isArray(response.rules)
-      ? response.rules.map((rule) => normalizeDraft(rule))
+      ? response.rules.map((rule) => normalizeRuleRecord(rule))
       : [],
+  };
+}
+
+async function getRule(payload) {
+  const ruleId =
+    typeof payload?.ruleId === "string" && payload.ruleId.trim()
+      ? payload.ruleId.trim()
+      : "";
+
+  if (!ruleId) {
+    throw new Error("A rule id is required before opening it.");
+  }
+
+  const response = await fetchJson(
+    `${BACKEND_URL}/api/rules/${ruleId}`,
+    undefined,
+    {
+      timeoutMs: RULE_BACKEND_TIMEOUT_MS,
+    },
+  );
+
+  return {
+    backendUrl: BACKEND_URL,
+    ...response,
+    rule: response.rule ? normalizeRuleRecord(response.rule) : null,
   };
 }
 
@@ -1068,13 +1128,14 @@ async function getDomSummary() {
 async function runAssistantTurn(payload) {
   const prompt =
     typeof payload?.prompt === "string" ? payload.prompt.trim() : "";
+  const attachments = normalizeAssistantUserImages(payload?.attachments);
   const previousResponseId =
     typeof payload?.previousResponseId === "string" && payload.previousResponseId.trim()
       ? payload.previousResponseId.trim()
       : null;
 
-  if (!prompt) {
-    throw new Error("Enter a message before asking Vibe Pilot.");
+  if (!prompt && !attachments.length) {
+    throw new Error("Enter a message or attach at least one image before asking Vibe Pilot.");
   }
 
   const messages = [];
@@ -1095,7 +1156,7 @@ async function runAssistantTurn(payload) {
   let emptyResponseRetryCount = 0;
   let assistantMessageId = createAssistantMessageId();
   let response = await requestAssistantResponse({
-    input: [buildAssistantUserInput(prompt)],
+    input: [buildAssistantUserInput(prompt, attachments)],
     previousResponseId,
   }, {
     assistantMessageId,
@@ -1541,17 +1602,57 @@ function publishFinalAssistantMessage(response, messageId, publishMessage) {
   );
 }
 
-function buildAssistantUserInput(prompt) {
+function buildAssistantUserInput(prompt, images = []) {
+  const content = [];
+  if (prompt) {
+    content.push({
+      type: "input_text",
+      text: prompt,
+    });
+  }
+
+  images.forEach((image) => {
+    content.push(image);
+  });
+
   return {
     type: "message",
     role: "user",
-    content: [
-      {
-        type: "input_text",
-        text: prompt,
-      },
-    ],
+    content,
   };
+}
+
+function normalizeAssistantUserImages(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((image) => {
+      const imageUrl =
+        typeof image?.image_url === "string" ? image.image_url.trim() : "";
+      const detail =
+        image?.detail === "low" || image?.detail === "high" || image?.detail === "auto"
+          ? image.detail
+          : "auto";
+
+      if (
+        !imageUrl ||
+        (!imageUrl.startsWith("data:image/") &&
+          !imageUrl.startsWith("https://") &&
+          !imageUrl.startsWith("http://"))
+      ) {
+        return null;
+      }
+
+      return {
+        detail,
+        image_url: imageUrl,
+        type: "input_image",
+      };
+    })
+    .filter(Boolean)
+    .slice(0, CHAT_IMAGE_ATTACHMENT_LIMIT);
 }
 
 function buildAssistantDeveloperInput(text) {
@@ -2358,8 +2459,98 @@ function normalizeDraft(payload) {
   };
 }
 
-async function persistRule(draft) {
-  const normalizedRule = normalizeDraft(draft);
+function normalizeRuleRecord(payload) {
+  const draft = normalizeDraft(payload);
+
+  return {
+    ...draft,
+    chatMessages: normalizeAssistantTranscriptMessages(payload?.chatMessages),
+    chatPreviousResponseId: readOptionalString(payload?.chatPreviousResponseId),
+  };
+}
+
+function normalizeAssistantTranscriptMessages(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.reduce((result, item) => {
+    const role =
+      item?.role === "assistant" || item?.role === "tool" || item?.role === "user"
+        ? item.role
+        : "assistant";
+    const text = typeof item?.text === "string" ? item.text : "";
+    const toolArgumentsText =
+      typeof item?.toolArgumentsText === "string" ? item.toolArgumentsText : "";
+    const images = normalizeAssistantTranscriptImages(item?.images);
+
+    if (!text.trim() && !toolArgumentsText.trim() && !images.length) {
+      return result;
+    }
+
+    result.push({
+      createdAt:
+        typeof item?.createdAt === "string" && item.createdAt.trim()
+          ? item.createdAt.trim()
+          : new Date().toISOString(),
+      id:
+        typeof item?.id === "string" && item.id.trim()
+          ? item.id.trim()
+          : `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      images,
+      role,
+      status:
+        typeof item?.status === "string" && item.status.trim()
+          ? item.status.trim()
+          : "ok",
+      text,
+      toolArgumentsText,
+      toolName:
+        typeof item?.toolName === "string" && item.toolName.trim()
+          ? item.toolName.trim()
+          : null,
+    });
+    return result;
+  }, []);
+}
+
+function normalizeAssistantTranscriptImages(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.reduce((result, item) => {
+    const url = typeof item?.url === "string" ? item.url.trim() : "";
+    if (!url) {
+      return result;
+    }
+
+    result.push({
+      alt:
+        typeof item?.alt === "string" && item.alt.trim()
+          ? item.alt.trim()
+          : "Screenshot",
+      label:
+        typeof item?.label === "string" && item.label.trim()
+          ? item.label.trim()
+          : "",
+      url,
+    });
+    return result;
+  }, []);
+}
+
+function readOptionalString(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+async function persistRule(rule) {
+  const normalizedRule = normalizeRuleRecord(rule);
   const requestBody = {
     name: readRequiredRuleName(normalizedRule.name),
     matchPattern: normalizedRule.matchPattern,
@@ -2367,6 +2558,8 @@ async function persistRule(draft) {
     css: normalizedRule.css,
     javascript: normalizedRule.javascript,
     files: normalizedRule.files,
+    chatMessages: normalizedRule.chatMessages,
+    chatPreviousResponseId: normalizedRule.chatPreviousResponseId,
   };
 
   const endpoint = normalizedRule.id
