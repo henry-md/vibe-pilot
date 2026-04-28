@@ -9,12 +9,24 @@ const CORS_HEADERS = {
 
 type RuleInput = {
   name: string;
-  targetUrl: string | null;
-  targetTitle: string | null;
   matchPattern: string;
   html: string;
   css: string;
   javascript: string;
+  files: Array<{
+    path: string;
+    mimeType: string;
+    content: string;
+  }>;
+};
+
+type StoredRuleInput = {
+  name: string;
+  matchPattern: string;
+  html: string;
+  css: string;
+  javascript: string;
+  files: string;
 };
 
 export async function GET(request: NextRequest) {
@@ -35,7 +47,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(
       {
-        rules,
+        rules: rules.map(serializeRule),
       },
       {
         headers: CORS_HEADERS,
@@ -93,12 +105,12 @@ export async function POST(request: NextRequest) {
   try {
     const prisma = await getPrisma();
     const created = await prisma.rule.create({
-      data: rule,
+      data: serializeStoredRuleInput(rule),
     });
 
     return NextResponse.json(
       {
-        rule: created,
+        rule: serializeRule(created),
       },
       {
         status: 201,
@@ -134,12 +146,11 @@ function normalizeRuleInput(payload: unknown): RuleInput {
 
   return {
     name: readRequiredString(record.name, "Rule name is required."),
-    targetUrl: readOptionalString(record.targetUrl),
-    targetTitle: readOptionalString(record.targetTitle),
     matchPattern: readString(record.matchPattern, "*://*/*"),
     html: readText(record.html),
     css: readText(record.css),
     javascript: readText(record.javascript),
+    files: readRuleFiles(record.files),
   };
 }
 
@@ -165,15 +176,70 @@ function readString(value: unknown, fallback: string) {
   return trimmed ? trimmed : fallback;
 }
 
-function readOptionalString(value: unknown) {
-  if (typeof value !== "string") {
-    return null;
-  }
-
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
 function readText(value: unknown) {
   return typeof value === "string" ? value : "";
+}
+
+function readRuleFiles(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.reduce<Array<{ path: string; mimeType: string; content: string }>>(
+    (result, item) => {
+      const record = item && typeof item === "object" ? item : null;
+      const path =
+        typeof record?.path === "string" ? record.path.trim() : "";
+      const content = typeof record?.content === "string" ? record.content : "";
+
+      if (!path) {
+        return result;
+      }
+
+      result.push({
+        path,
+        mimeType:
+          typeof record?.mimeType === "string" ? record.mimeType.trim() : "",
+        content,
+      });
+      return result;
+    },
+    [],
+  );
+}
+
+function serializeStoredRuleInput(rule: RuleInput): StoredRuleInput {
+  return {
+    name: rule.name,
+    matchPattern: rule.matchPattern,
+    html: rule.html,
+    css: rule.css,
+    javascript: rule.javascript,
+    files: JSON.stringify(rule.files),
+  };
+}
+
+function serializeRule(rule: {
+  id: string;
+  name: string;
+  matchPattern: string;
+  html: string;
+  css: string;
+  javascript: string;
+  files: string;
+  createdAt: Date;
+  updatedAt: Date;
+}) {
+  return {
+    ...rule,
+    files: parseStoredRuleFiles(rule.files),
+  };
+}
+
+function parseStoredRuleFiles(value: string) {
+  try {
+    return readRuleFiles(JSON.parse(value));
+  } catch {
+    return [];
+  }
 }

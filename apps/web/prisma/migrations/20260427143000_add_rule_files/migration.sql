@@ -1,0 +1,2 @@
+ALTER TABLE "Rule"
+ADD COLUMN "files" TEXT NOT NULL DEFAULT '[]';

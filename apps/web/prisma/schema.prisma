@@ -10,12 +10,11 @@ datasource db {
 model Rule {
   id           String   @id @default(cuid())
   name         String
-  targetUrl    String?  @db.Text
-  targetTitle  String?
   matchPattern String   @default("*://*/*")
   html         String   @default("") @db.Text
   css          String   @default("") @db.Text
   javascript   String   @default("") @db.Text
+  files        String   @default("[]") @db.Text
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }
