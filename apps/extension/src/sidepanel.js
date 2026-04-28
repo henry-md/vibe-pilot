@@ -1115,16 +1115,15 @@ function renderChatMessages() {
   }
 
   if (!state.assistantMessages.length) {
-    elements.chatMessages.innerHTML = `
-      <div class="chat-empty-state">
-        Vibe Pilot can inspect the page, read the DOM, capture screenshots, update the draft,
-        apply it, and re-check the result before replying.
-      </div>
-    `;
+    elements.chatPanel?.classList.add("is-empty");
+    elements.chatMessages.classList.add("is-empty");
+    elements.chatMessages.innerHTML = "";
     syncWorkspaceState();
     return;
   }
 
+  elements.chatPanel?.classList.remove("is-empty");
+  elements.chatMessages.classList.remove("is-empty");
   elements.chatMessages.innerHTML = groupAssistantMessages(state.assistantMessages)
     .map((block) => renderTranscriptBlock(block))
     .join("");
@@ -1154,6 +1153,16 @@ function groupAssistantMessages(messages) {
       continue;
     }
 
+    if (toolMessages.length && message.role === "assistant") {
+      blocks.push({
+        message,
+        toolMessages,
+        type: "assistant-turn",
+      });
+      toolMessages = [];
+      continue;
+    }
+
     flushToolMessages();
     blocks.push({
       message,
@@ -1167,13 +1176,41 @@ function groupAssistantMessages(messages) {
 
 function renderTranscriptBlock(block) {
   if (block.type === "tool-group") {
-    return renderToolGroup(block.messages);
+    return renderToolThread(block.messages);
+  }
+
+  if (block.type === "assistant-turn") {
+    return renderAssistantTurn(block.message, block.toolMessages);
   }
 
   return renderChatMessage(block.message);
 }
 
-function renderChatMessage(message) {
+function renderAssistantTurn(message, toolMessages) {
+  const verificationImages = collectToolImages(toolMessages);
+  const latestImage =
+    verificationImages.length > 0
+      ? verificationImages[verificationImages.length - 1]
+      : null;
+  const assistantMessage = latestImage
+    ? {
+        ...message,
+        images: [latestImage],
+      }
+    : message;
+
+  return `
+    ${renderChatMessage(assistantMessage, {
+        compactImages: Boolean(latestImage),
+        toolMarkup: renderToolGroup(toolMessages, {
+          hideImages: verificationImages.length > 0,
+          nested: true,
+        }),
+      })}
+  `;
+}
+
+function renderChatMessage(message, options = {}) {
   const metaBits = [];
   const label =
     message.role === "user"
@@ -1184,74 +1221,119 @@ function renderChatMessage(message) {
 
   metaBits.push(`<span>${escapeHtml(label)}</span>`);
 
+  if (message.role === "assistant" && message.status === "streaming") {
+    metaBits.push('<span class="chat-meta-pill chat-meta-pill-running">Streaming</span>');
+  }
+
   if (message.role === "tool" && message.status === "error") {
     metaBits.push('<span class="chat-meta-pill chat-meta-pill-error">Tool error</span>');
   }
 
-  const imagesMarkup = renderImageCards(message.images);
+  const imagesMarkup = Array.isArray(message.images) && message.images.length > 0
+    ? renderImageCards(message.images, {
+        compact: Boolean(options.compactImages),
+      })
+    : "";
+  const messageRole = message.role === "user" ? "user" : "assistant";
+  const avatarText = messageRole === "user" ? "ME" : "AI";
+  const toolMarkup = typeof options.toolMarkup === "string" ? options.toolMarkup : "";
 
   return `
-    <article class="chat-message chat-message-${escapeHtml(message.role)}">
-      <div class="chat-message-meta">${metaBits.join("")}</div>
-      ${message.text ? `<p class="chat-message-text">${formatMultilineText(message.text)}</p>` : ""}
-      ${imagesMarkup ? `<div class="chat-image-grid">${imagesMarkup}</div>` : ""}
-    </article>
+    <section class="chat-row chat-row-${messageRole}">
+      <span class="chat-avatar chat-avatar-${messageRole}">${escapeHtml(avatarText)}</span>
+      <article class="chat-message chat-message-${escapeHtml(message.role)}">
+        <div class="chat-message-meta">${metaBits.join("")}</div>
+        ${message.text ? `<p class="chat-message-text">${formatMultilineText(message.text)}</p>` : ""}
+        ${imagesMarkup ? `<div class="chat-image-grid">${imagesMarkup}</div>` : ""}
+        ${toolMarkup}
+      </article>
+    </section>
   `;
 }
 
-function renderToolGroup(messages) {
-  const uniqueToolLabels = Array.from(
-    new Set(
-      messages
-        .map((message) => formatToolLabel(message.toolName))
-        .filter(Boolean),
-    ),
-  );
+function renderToolGroup(messages, options = {}) {
   const hasError = messages.some((message) => message.status === "error");
+  const hasRunning = messages.some((message) => message.status === "running");
   const screenshotCount = messages.reduce(
     (count, message) => count + message.images.length,
     0,
   );
+  const shouldAutoOpen = hasError || hasRunning;
   const summaryCopy = [
-    `${messages.length} tool call${messages.length === 1 ? "" : "s"}`,
+    `${messages.length} command${messages.length === 1 ? "" : "s"}`,
     screenshotCount
       ? `${screenshotCount} screenshot${screenshotCount === 1 ? "" : "s"}`
-      : null,
+      : "no screenshots",
+    screenshotCount ? "click any screenshot to expand" : null,
   ]
     .filter(Boolean)
     .join(" · ");
 
-  const pillMarkup = uniqueToolLabels
-    .slice(0, 5)
-    .map(
-      (label) => `<span class="chat-tool-pill">${escapeHtml(label)}</span>`,
+  const callMarkup = messages
+    .map((message, index) =>
+      renderToolCall(message, index, {
+        hideImages: options.hideImages,
+      }),
     )
     .join("");
 
-  const callMarkup = messages
-    .map((message, index) => renderToolCall(message, index))
-    .join("");
-
   return `
-    <details class="chat-tool-group${hasError ? " is-error" : ""}" ${
-      hasError ? "open" : ""
+    <details class="chat-tool-group${hasError ? " is-error" : ""}${
+      options.nested ? " chat-tool-group-nested" : ""
+    }" ${
+      shouldAutoOpen ? "open" : ""
     }>
       <summary class="chat-tool-summary">
-        <div class="chat-tool-summary-top">
-          <span class="chat-tool-summary-title">See tool calls</span>
-          <span class="chat-meta-pill">${messages.length}</span>
-        </div>
-        ${pillMarkup ? `<div class="chat-tool-pill-row">${pillMarkup}</div>` : ""}
-        <p class="chat-tool-summary-copy">${escapeHtml(summaryCopy)}</p>
+        <span class="chat-tool-summary-title">See Toolcalls</span>
+        <span class="chat-tool-summary-arrow" aria-hidden="true">
+          <svg viewBox="0 0 16 16">
+            <path
+              d="M4.25 6.25 8 10l3.75-3.75"
+              fill="none"
+              stroke="currentColor"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              stroke-width="1.4"
+            />
+          </svg>
+        </span>
       </summary>
-      <div class="chat-toolcall-list">${callMarkup}</div>
+      <div class="chat-toolcall-list">
+        <p class="chat-tool-summary-copy">${escapeHtml(summaryCopy)}</p>
+        ${callMarkup}
+      </div>
     </details>
   `;
 }
 
-function renderToolCall(message, index) {
+function renderToolThread(messages) {
+  return `
+    <section class="chat-row chat-row-assistant">
+      <span class="chat-avatar chat-avatar-assistant">AI</span>
+      <article class="chat-message chat-message-assistant">
+        ${renderToolGroup(messages, {
+          nested: true,
+        })}
+      </article>
+    </section>
+  `;
+}
+
+function renderToolCall(message, index, options = {}) {
   const toolLabel = formatToolLabel(message.toolName) || "Tool";
-  const imagesMarkup = renderImageCards(message.images);
+  const argumentsMarkup = renderToolArguments(message.toolArgumentsText);
+  const imagesMarkup = options.hideImages ? "" : renderImageCards(message.images);
+  const metaPills = [];
+
+  if (message.images.length > 0) {
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-verified">Screenshot</span>');
+  }
+
+  if (message.status === "error") {
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-error">Error</span>');
+  } else if (message.status === "running") {
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-running">Running</span>');
+  }
 
   return `
     <article class="chat-toolcall${message.status === "error" ? " is-error" : ""}">
@@ -1260,19 +1342,45 @@ function renderToolCall(message, index) {
           <span class="chat-toolcall-index">${index + 1}</span>
           <strong class="chat-toolcall-name">${escapeHtml(toolLabel)}</strong>
         </div>
-        ${
-          message.status === "error"
-            ? '<span class="chat-meta-pill chat-meta-pill-error">Error</span>'
-            : ""
-        }
+        ${metaPills.join("")}
       </div>
-      ${message.text ? `<p class="chat-toolcall-text">${formatMultilineText(message.text)}</p>` : ""}
       ${imagesMarkup ? `<div class="chat-image-grid">${imagesMarkup}</div>` : ""}
+      ${message.text ? `<p class="chat-toolcall-text">${formatMultilineText(message.text)}</p>` : ""}
+      ${argumentsMarkup}
     </article>
   `;
 }
 
-function renderImageCards(images) {
+function renderToolArguments(argumentsText) {
+  if (
+    typeof argumentsText !== "string" ||
+    !argumentsText.trim() ||
+    argumentsText.trim() === "{}"
+  ) {
+    return "";
+  }
+
+  return `
+    <details class="chat-toolcall-disclosure">
+      <summary class="chat-toolcall-disclosure-summary">Input</summary>
+      <pre class="chat-toolcall-args">${escapeHtml(formatToolArguments(argumentsText))}</pre>
+    </details>
+  `;
+}
+
+function collectToolImages(messages) {
+  if (!Array.isArray(messages) || !messages.length) {
+    return [];
+  }
+
+  return messages.flatMap((message) =>
+    Array.isArray(message.images)
+      ? message.images.filter((image) => typeof image?.url === "string" && image.url.trim())
+      : [],
+  );
+}
+
+function renderImageCards(images, options = {}) {
   if (!Array.isArray(images) || !images.length) {
     return "";
   }
@@ -1280,9 +1388,12 @@ function renderImageCards(images) {
   return images
     .map((image) => {
       const label = image.label || image.alt || "Screenshot";
+      const compactClass = options.compact ? " chat-image-card-compact" : "";
+      const frameClass = options.compact ? " chat-image-frame-compact" : "";
+      const imageClass = options.compact ? " chat-image-compact" : "";
 
       return `
-        <figure class="chat-image-card">
+        <figure class="chat-image-card${compactClass}">
           <button
             class="chat-image-button"
             type="button"
@@ -1291,8 +1402,8 @@ function renderImageCards(images) {
             data-image-alt="${escapeHtml(image.alt)}"
             data-image-label="${escapeHtml(label)}"
           >
-            <span class="chat-image-frame">
-              <img class="chat-image" src="${escapeHtml(image.url)}" alt="${escapeHtml(image.alt)}" />
+            <span class="chat-image-frame${frameClass}">
+              <img class="chat-image${imageClass}" src="${escapeHtml(image.url)}" alt="${escapeHtml(image.alt)}" />
               <span class="chat-image-zoom">Expand</span>
             </span>
           </button>
@@ -1356,6 +1467,18 @@ function formatToolLabel(value) {
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+}
+
+function formatToolArguments(argumentsText) {
+  if (typeof argumentsText !== "string" || !argumentsText.trim()) {
+    return "";
+  }
+
+  try {
+    return JSON.stringify(JSON.parse(argumentsText), null, 2);
+  } catch {
+    return argumentsText.trim();
+  }
 }
 
 async function syncDraftFromAssistant(rule) {
