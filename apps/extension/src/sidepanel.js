@@ -338,7 +338,18 @@ function wireEvents() {
     if (ruleButton instanceof HTMLElement) {
       const ruleId = ruleButton.getAttribute("data-edit-rule-id");
       if (ruleId) {
-        void openRuleEditor(ruleId);
+        const selectedRule = state.rules.find((item) => item.id === ruleId);
+        const ruleName = selectedRule?.name ?? "rule";
+
+        void runAction(
+          async () => {
+            await openRuleEditor(ruleId, {
+              applyOnOpen: true,
+            });
+          },
+          `Opening and applying "${ruleName}"...`,
+          `"${ruleName}" applied.`,
+        );
       }
     }
   });
@@ -479,7 +490,8 @@ async function leaveSavedRule() {
   await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
 }
 
-async function applyCurrentRule() {
+async function applyCurrentRule(options = {}) {
+  const returnToRules = options.returnToRules !== false;
   const rule = readWorkspaceRule();
   if (!hasRuleContent(rule)) {
     throw new Error("Add code to at least one file before you apply.");
@@ -524,7 +536,7 @@ async function applyCurrentRule() {
   await persistCurrentFileNames();
   await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
 
-  if (response?.rule) {
+  if (response?.rule && returnToRules) {
     switchView("rules");
   }
 }
@@ -820,7 +832,8 @@ function renderRulesList(rules) {
             class="rule-card"
             type="button"
             data-edit-rule-id="${escapeHtml(rule.id)}"
-            aria-label="Open ${escapeHtml(rule.name)}"
+            aria-label="Open and apply ${escapeHtml(rule.name)}"
+            title="Open and apply ${escapeHtml(rule.name)}"
           >
             <strong class="rule-card-name">${escapeHtml(rule.name)}</strong>
             <p class="rule-card-meta">${escapeHtml(target)}</p>
@@ -849,7 +862,7 @@ function renderRulesList(rules) {
     .join("");
 }
 
-async function openRuleEditor(ruleId) {
+async function openRuleEditor(ruleId, options = {}) {
   const rule = state.rules.find((item) => item.id === ruleId);
   if (!rule) {
     setError("That rule could not be found.");
@@ -866,6 +879,14 @@ async function openRuleEditor(ruleId) {
   switchView("create");
   await persistCurrentFileNames();
   await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
+
+  if (options.applyOnOpen) {
+    await applyCurrentRule({
+      returnToRules: false,
+    });
+    return;
+  }
+
   setStatus(`Editing "${rule.name}".`);
 }
 
