@@ -23,6 +23,14 @@ const DEFAULT_MODEL = "gpt-5";
 const ASSISTANT_DEBUG_ENABLED =
   process.env.VIBE_PILOT_ASSISTANT_DEBUG?.trim() === "1";
 
+function getAssistantApiKey() {
+  return process.env.OPENAI_API_KEY?.trim() ?? "";
+}
+
+function getAssistantModel() {
+  return process.env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
+}
+
 function summarizeAssistantInput(
   input: VibePilotAssistantRequest["input"],
 ) {
@@ -86,7 +94,7 @@ function buildAssistantCreateParams(
   requestData: VibePilotAssistantRequest,
 ) {
   return {
-    model: process.env.OPENAI_MODEL || DEFAULT_MODEL,
+    model: getAssistantModel(),
     store: shouldStoreAssistantResponses(),
     instructions: VIBE_PILOT_SYSTEM_PROMPT,
     input: requestData.input as never,
@@ -187,7 +195,9 @@ function createSseEvent(event: string, payload: unknown) {
 }
 
 export async function POST(request: NextRequest) {
-  if (!process.env.OPENAI_API_KEY) {
+  const apiKey = getAssistantApiKey();
+
+  if (!apiKey) {
     return jsonError(
       {
         error: "OPENAI_API_KEY is not configured on the web backend.",
@@ -221,7 +231,7 @@ export async function POST(request: NextRequest) {
   }
 
   const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
+    apiKey,
   });
   const startedAt = Date.now();
 

@@ -1,4 +1,4 @@
-import { BACKEND_URL } from "./config.js";
+import { BACKEND_URL, HOT_RELOAD_ENABLED } from "./config.js";
 import {
   DEFAULT_DRAFT,
   DEFAULT_WORKSPACE_RULE,
@@ -7,10 +7,13 @@ import {
 
 const ACTIVE_SCRIPT_ID = "vibe-pilot-live-script";
 const ASSISTANT_PROGRESS_PORT_NAME = "vibe-pilot-assistant-progress";
+const DEFAULT_REMOTE_BACKEND_URL = "https://vibe-pilotweb-production.up.railway.app";
 const LOCAL_BACKEND_URL = "http://127.0.0.1:3001";
 const OVERLAY_HOST_ID = "__vibe_pilot_host__";
 const OVERLAY_ROOT_ID = "__vibe_pilot_root__";
 const OVERLAY_STYLE_ID = "__vibe_pilot_style__";
+const BACKEND_HEALTH_PROBE_TIMEOUT_MS = 1500;
+const BACKEND_HEALTH_CACHE_TTL_MS = 15000;
 const TAB_INJECTION_TIMEOUT_MS = 2500;
 const RULE_BACKEND_TIMEOUT_MS = 8000;
 const ASSISTANT_BACKEND_TIMEOUT_MS = 120000;
@@ -33,6 +36,9 @@ const STORAGE_KEYS = {
 
 const assistantProgressPorts = new Set();
 let lastScreenshotCapturedAt = 0;
+let localBackendPreferenceCheckedAt = 0;
+let localBackendPreferencePromise = null;
+let preferLocalBackendCache = false;
 
 chrome.runtime.onInstalled.addListener((details) => {
   void bootstrap(details.reason);
@@ -154,7 +160,7 @@ async function getStatusPayload() {
 
   return {
     activeTab,
-    backendUrl: BACKEND_URL,
+    backendUrl: await getPreferredBackendBaseUrl(),
     draft: draftState.workspaceDraft,
     liveScriptRegistered: registered,
     userScripts: availability,
@@ -180,7 +186,7 @@ async function saveRule(payload) {
   await setWorkspaceDraft(savedRule);
 
   return {
-    backendUrl: BACKEND_URL,
+    backendUrl: response.backendUrl,
     ...response,
     rule: savedRule,
   };
@@ -203,10 +209,12 @@ async function applyDraft(payload) {
   const injectionResult = await injectIntoMatchingTabs(draft);
 
   let remoteSaved = false;
+  let backendUrl = await getPreferredBackendBaseUrl();
   let savedRule = null;
   try {
     const response = await persistRule(persistedRule);
     savedRule = response.rule ? normalizeRuleRecord(response.rule) : null;
+    backendUrl = response.backendUrl ?? backendUrl;
     if (savedRule) {
       await setActiveDraft(savedRule);
     }
@@ -220,6 +228,7 @@ async function applyDraft(payload) {
 
   return {
     applied: true,
+    backendUrl,
     draft,
     remoteSaved,
     rule: savedRule,
@@ -229,8 +238,8 @@ async function applyDraft(payload) {
 }
 
 async function listRules() {
-  const response = await fetchJson(
-    `${BACKEND_URL}/api/rules?limit=100`,
+  const { backendUrl, payload: response } = await fetchBackendJson(
+    "/api/rules?limit=100",
     undefined,
     {
       timeoutMs: RULE_BACKEND_TIMEOUT_MS,
@@ -238,7 +247,7 @@ async function listRules() {
   );
 
   return {
-    backendUrl: BACKEND_URL,
+    backendUrl,
     ...response,
     rules: Array.isArray(response.rules)
       ? response.rules.map((rule) => normalizeRuleRecord(rule))
@@ -256,8 +265,8 @@ async function getRule(payload) {
     throw new Error("A rule id is required before opening it.");
   }
 
-  const response = await fetchJson(
-    `${BACKEND_URL}/api/rules/${ruleId}`,
+  const { backendUrl, payload: response } = await fetchBackendJson(
+    `/api/rules/${ruleId}`,
     undefined,
     {
       timeoutMs: RULE_BACKEND_TIMEOUT_MS,
@@ -265,7 +274,7 @@ async function getRule(payload) {
   );
 
   return {
-    backendUrl: BACKEND_URL,
+    backendUrl,
     ...response,
     rule: response.rule ? normalizeRuleRecord(response.rule) : null,
   };
@@ -281,11 +290,15 @@ async function deleteRule(payload) {
     throw new Error("A rule id is required before deleting.");
   }
 
-  const response = await fetchJson(`${BACKEND_URL}/api/rules/${ruleId}`, {
-    method: "DELETE",
-  }, {
-    timeoutMs: RULE_BACKEND_TIMEOUT_MS,
-  });
+  const { backendUrl, payload: response } = await fetchBackendJson(
+    `/api/rules/${ruleId}`,
+    {
+      method: "DELETE",
+    },
+    {
+      timeoutMs: RULE_BACKEND_TIMEOUT_MS,
+    },
+  );
 
   const activeDraft = await loadActiveDraft();
   if (activeDraft?.id === ruleId) {
@@ -293,7 +306,7 @@ async function deleteRule(payload) {
   }
 
   return {
-    backendUrl: BACKEND_URL,
+    backendUrl,
     ...response,
   };
 }
@@ -1246,7 +1259,7 @@ async function runAssistantTurn(payload) {
 
   return {
     activeTab: await getTargetTabDetails(),
-    backendUrl: BACKEND_URL,
+    backendUrl: response.backendUrl ?? (await getPreferredBackendBaseUrl()),
     currentDraft: await loadWorkspaceDraft(),
     messages,
     previousResponseId: response.responseId,
@@ -1311,6 +1324,10 @@ async function requestAssistantResponse(payload, options = {}) {
   return {
     assistantText:
       typeof response?.assistantText === "string" ? response.assistantText : "",
+    backendUrl:
+      typeof response?.backendUrl === "string" && response.backendUrl.trim()
+        ? response.backendUrl.trim()
+        : null,
     functionCalls: Array.isArray(response?.functionCalls) ? response.functionCalls : [],
     responseId:
       typeof response?.responseId === "string" && response.responseId.trim()
@@ -1320,7 +1337,7 @@ async function requestAssistantResponse(payload, options = {}) {
 }
 
 async function fetchAssistantResponsePayload(path, payload, options = {}) {
-  const candidates = buildBackendCandidateUrls(path);
+  const candidates = await buildBackendCandidateUrls(path);
   let lastError = null;
 
   for (let index = 0; index < candidates.length; index += 1) {
@@ -1333,10 +1350,10 @@ async function fetchAssistantResponsePayload(path, payload, options = {}) {
 
       if (
         index < candidates.length - 1 &&
-        shouldRetryAssistantWithLocalBackend(error, url)
+        shouldRetryWithNextBackendCandidate(error)
       ) {
         console.warn(
-          "Assistant backend request failed; retrying with the local backend.",
+          "Assistant backend request failed; retrying with another backend candidate.",
           {
             details:
               error instanceof Error ? error.message : String(error ?? ""),
@@ -1407,7 +1424,14 @@ async function readAssistantResponse(url, payload, options = {}) {
       !contentType.toLowerCase().includes("text/event-stream") ||
       !response.body
     ) {
-      return await response.json();
+      const payload = await response.json();
+      if (payload && typeof payload === "object") {
+        return {
+          ...payload,
+          backendUrl: getBackendOrigin(url),
+        };
+      }
+      return payload;
     }
 
     const reader = response.body.getReader();
@@ -1488,7 +1512,10 @@ async function readAssistantResponse(url, payload, options = {}) {
       );
     }
 
-    return finalPayload;
+    return {
+      ...finalPayload,
+      backendUrl: getBackendOrigin(url),
+    };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -1544,22 +1571,15 @@ function parseSseEvent(chunk) {
   }
 }
 
-function buildBackendCandidateUrls(path) {
+async function buildBackendCandidateUrls(path) {
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  const candidates = [`${BACKEND_URL}${normalizedPath}`];
-
-  if (!isLocalBackendUrl(BACKEND_URL)) {
-    candidates.push(`${LOCAL_BACKEND_URL}${normalizedPath}`);
-  }
-
-  return Array.from(new Set(candidates));
+  const baseUrls = await getBackendBaseUrls();
+  return Array.from(
+    new Set(baseUrls.map((baseUrl) => `${baseUrl}${normalizedPath}`)),
+  );
 }
 
-function shouldRetryAssistantWithLocalBackend(error, candidateUrl) {
-  if (isLocalBackendUrl(candidateUrl)) {
-    return false;
-  }
-
+function shouldRetryWithNextBackendCandidate(error) {
   const message =
     error instanceof Error ? error.message : String(error ?? "");
   const backendStatus =
@@ -1575,7 +1595,11 @@ function shouldRetryAssistantWithLocalBackend(error, candidateUrl) {
     return true;
   }
 
-  return backendStatus === 404 || backendStatus >= 500;
+  return (
+    message.startsWith("Unable to reach the backend at ") ||
+    backendStatus === 404 ||
+    backendStatus >= 500
+  );
 }
 
 function isLocalBackendUrl(value) {
@@ -1583,6 +1607,82 @@ function isLocalBackendUrl(value) {
     return new URL(value).origin === new URL(LOCAL_BACKEND_URL).origin;
   } catch {
     return false;
+  }
+}
+
+async function getBackendBaseUrls() {
+  if (isLocalBackendUrl(BACKEND_URL)) {
+    return [LOCAL_BACKEND_URL];
+  }
+
+  const preferLocalBackend = await shouldPreferLocalBackend();
+  return preferLocalBackend
+    ? [LOCAL_BACKEND_URL, BACKEND_URL]
+    : [BACKEND_URL, LOCAL_BACKEND_URL];
+}
+
+async function getPreferredBackendBaseUrl() {
+  const baseUrls = await getBackendBaseUrls();
+  return baseUrls[0] ?? BACKEND_URL;
+}
+
+async function shouldPreferLocalBackend() {
+  if (!shouldAutoPreferLocalBackend()) {
+    return false;
+  }
+
+  const now = Date.now();
+  if (now - localBackendPreferenceCheckedAt < BACKEND_HEALTH_CACHE_TTL_MS) {
+    return preferLocalBackendCache;
+  }
+
+  if (!localBackendPreferencePromise) {
+    localBackendPreferencePromise = probeLocalBackendAvailability()
+      .then((isAvailable) => {
+        preferLocalBackendCache = isAvailable;
+        localBackendPreferenceCheckedAt = Date.now();
+        return isAvailable;
+      })
+      .finally(() => {
+        localBackendPreferencePromise = null;
+      });
+  }
+
+  return localBackendPreferencePromise;
+}
+
+function shouldAutoPreferLocalBackend() {
+  return HOT_RELOAD_ENABLED || BACKEND_URL === DEFAULT_REMOTE_BACKEND_URL;
+}
+
+async function probeLocalBackendAvailability() {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, BACKEND_HEALTH_PROBE_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(`${LOCAL_BACKEND_URL}/api/health`, {
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return false;
+    }
+
+    const payload = await response.json().catch(() => null);
+    return payload?.app === "vibe-pilot-web";
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+function getBackendOrigin(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return value;
   }
 }
 
@@ -2562,19 +2662,61 @@ async function persistRule(rule) {
     chatPreviousResponseId: normalizedRule.chatPreviousResponseId,
   };
 
-  const endpoint = normalizedRule.id
-    ? `${BACKEND_URL}/api/rules/${normalizedRule.id}`
-    : `${BACKEND_URL}/api/rules`;
-
-  return fetchJson(endpoint, {
-    method: normalizedRule.id ? "PATCH" : "POST",
-    headers: {
-      "Content-Type": "application/json",
+  return fetchBackendJson(
+    normalizedRule.id ? `/api/rules/${normalizedRule.id}` : "/api/rules",
+    {
+      method: normalizedRule.id ? "PATCH" : "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
     },
-    body: JSON.stringify(requestBody),
-  }, {
-    timeoutMs: RULE_BACKEND_TIMEOUT_MS,
-  });
+    {
+      timeoutMs: RULE_BACKEND_TIMEOUT_MS,
+    },
+  ).then(({ backendUrl, payload }) => ({
+    ...payload,
+    backendUrl,
+  }));
+}
+
+async function fetchBackendJson(path, init, options = {}) {
+  const candidates = await buildBackendCandidateUrls(path);
+  let lastError = null;
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const url = candidates[index];
+
+    try {
+      return {
+        backendUrl: getBackendOrigin(url),
+        payload: await fetchJson(url, init, options),
+      };
+    } catch (error) {
+      lastError = error;
+
+      if (
+        index < candidates.length - 1 &&
+        shouldRetryWithNextBackendCandidate(error)
+      ) {
+        console.warn(
+          "Backend request failed; retrying with another backend candidate.",
+          {
+            details:
+              error instanceof Error ? error.message : String(error ?? ""),
+            url,
+          },
+        );
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("The backend request failed.");
 }
 
 async function fetchJson(url, init, options = {}) {
