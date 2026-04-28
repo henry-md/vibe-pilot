@@ -62,6 +62,8 @@ const state = {
   assistantMessages: [],
   assistantProgressPort: null,
   assistantPreviousResponseId: null,
+  assistantTurnInProgress: false,
+  assistantTurnStartMessageId: null,
   activeTab: null,
   activeView: "create",
   confirmModalResolver: null,
@@ -73,12 +75,12 @@ const state = {
   hydrated: false,
   isBusy: false,
   hotReloading: false,
+  pendingChatImages: [],
   ruleFiles: [],
   rules: [],
 };
 
 const elements = {
-  activeFileTitle: document.querySelector("#active-file-title"),
   applyDraftButton: document.querySelector("#apply-draft-button"),
   cancelButton: document.querySelector("#cancel-button"),
   chatComposer: document.querySelector(".chat-composer"),
@@ -96,11 +98,12 @@ const elements = {
   chatImageLightboxClose: document.querySelector("#chat-image-lightbox-close"),
   chatImageLightboxImage: document.querySelector("#chat-image-lightbox-image"),
   chatImageLightboxTitle: document.querySelector("#chat-image-lightbox-title"),
-  chatClearButton: document.querySelector("#chat-clear-button"),
   chatImageInput: document.querySelector("#chat-image-input"),
   chatInput: document.querySelector("#chat-input"),
+  chatAttachments: document.querySelector("#chat-attachments"),
   chatMessages: document.querySelector("#chat-messages"),
   chatSendButton: document.querySelector("#chat-send-button"),
+  chatUploadButton: document.querySelector("#chat-upload-button"),
   cssSnippet: document.querySelector("#css-snippet"),
   errorBanner: document.querySelector("#error-banner"),
   fileCreateButton: document.querySelector("#file-tab-create-button"),
@@ -151,6 +154,7 @@ async function boot() {
   switchCreateMode(state.activeCreateMode);
   switchView("create");
   autoResizeChat();
+  renderPendingChatImages();
   renderChatMessages();
   renderScaffoldSuggestion();
   wireHotReload();
@@ -302,12 +306,90 @@ function wireEvents() {
     void sendAssistantMessage();
   });
 
+  elements.chatInput?.addEventListener("paste", (event) => {
+    const imageFiles = getClipboardImageFiles(event.clipboardData);
+    if (!imageFiles.length) {
+      return;
+    }
+
+    const pastedText = event.clipboardData?.getData("text/plain") ?? "";
+    if (!pastedText.trim()) {
+      event.preventDefault();
+    }
+
+    void addPendingChatImages(imageFiles, {
+      source: "clipboard",
+    });
+  });
+
+  elements.chatComposer?.addEventListener("dragover", (event) => {
+    if (!hasImageDataTransfer(event.dataTransfer)) {
+      return;
+    }
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+
+  elements.chatComposer?.addEventListener("drop", (event) => {
+    const imageFiles = getDataTransferImageFiles(event.dataTransfer);
+    if (!imageFiles.length) {
+      return;
+    }
+
+    event.preventDefault();
+    void addPendingChatImages(imageFiles, {
+      source: "drop",
+    });
+  });
+
   elements.chatSendButton?.addEventListener("click", () => {
     void sendAssistantMessage();
   });
 
-  elements.chatClearButton?.addEventListener("click", () => {
-    resetAssistantConversation();
+  elements.chatUploadButton?.addEventListener("click", () => {
+    elements.chatImageInput?.click();
+  });
+
+  elements.chatImageInput?.addEventListener("change", (event) => {
+    const input = event.target instanceof HTMLInputElement ? event.target : null;
+    const files = input?.files ? Array.from(input.files) : [];
+    if (input) {
+      input.value = "";
+    }
+
+    void addPendingChatImages(files, {
+      source: "upload",
+    });
+  });
+
+  elements.chatAttachments?.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) {
+      return;
+    }
+
+    const removeButton = target.closest("[data-remove-chat-image-id]");
+    if (removeButton instanceof HTMLElement) {
+      const imageId = removeButton.getAttribute("data-remove-chat-image-id");
+      if (imageId) {
+        removePendingChatImage(imageId);
+      }
+      return;
+    }
+
+    const previewButton = target.closest("[data-preview-chat-image-id]");
+    if (!(previewButton instanceof HTMLElement)) {
+      return;
+    }
+
+    const imageId = previewButton.getAttribute("data-preview-chat-image-id");
+    const image = state.pendingChatImages.find((item) => item.id === imageId);
+    if (!image) {
+      return;
+    }
+
+    openChatImageLightbox(image);
   });
 
   elements.chatMessages?.addEventListener("click", (event) => {
@@ -476,6 +558,7 @@ async function refreshStatus(options = {}) {
       writeWorkspaceRule(payload.draft ?? EMPTY_WORKSPACE_RULE, {
         fileNames: resolveFileNamesForRuleId(payload.draft?.id ?? null),
       });
+      restoreAssistantConversation(payload.draft);
       state.hydrated = true;
     }
 
@@ -531,45 +614,80 @@ async function createNamedScaffold(requestedNameOverride = "") {
 
 async function sendAssistantMessage() {
   const prompt = elements.chatInput?.value.trim() ?? "";
-  if (!prompt) {
+  const attachments = state.pendingChatImages.map((image) => ({
+    alt: image.alt,
+    detail: image.detail,
+    label: image.label,
+    url: image.url,
+  }));
+
+  if (!prompt && !attachments.length) {
     return;
   }
 
-  appendAssistantMessages([
-    createAssistantMessage("user", prompt),
-  ]);
+  const userMessage = createAssistantMessage("user", prompt, {
+    images: attachments.map((image) => ({
+      alt: image.alt,
+      label: image.label,
+      url: image.url,
+    })),
+  });
+
+  appendAssistantMessages([userMessage]);
+  state.assistantTurnInProgress = true;
+  state.assistantTurnStartMessageId = userMessage.id;
   clearChat();
 
-  await runAction(
-    async () => {
-      await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
-      const response = await sendMessage("VIBE_PILOT_RUN_ASSISTANT", {
-        prompt,
-        previousResponseId: state.assistantPreviousResponseId,
-      });
+  try {
+    await runAction(
+      async () => {
+        await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
+        const response = await sendMessage("VIBE_PILOT_RUN_ASSISTANT", {
+          attachments: attachments.map((image) => ({
+            detail: image.detail,
+            image_url: image.url,
+          })),
+          prompt,
+          previousResponseId: state.assistantPreviousResponseId,
+        });
 
-      state.assistantPreviousResponseId =
-        typeof response?.previousResponseId === "string" &&
-        response.previousResponseId.trim()
-          ? response.previousResponseId.trim()
-          : null;
+        state.assistantPreviousResponseId =
+          typeof response?.previousResponseId === "string" &&
+          response.previousResponseId.trim()
+            ? response.previousResponseId.trim()
+            : null;
 
-      if (response?.activeTab) {
-        state.activeTab = response.activeTab;
-        renderScaffoldSuggestion();
-      }
+        if (response?.activeTab) {
+          state.activeTab = response.activeTab;
+          renderScaffoldSuggestion();
+        }
 
-      if (response?.currentDraft) {
-        await syncDraftFromAssistant(response.currentDraft);
-      }
+        if (response?.currentDraft) {
+          await syncDraftFromAssistant(response.currentDraft);
+        }
 
-      if (Array.isArray(response?.messages) && response.messages.length > 0) {
-        appendAssistantMessages(normalizeAssistantMessages(response.messages));
-      }
-    },
-    "Vibe Pilot is working...",
-    "Assistant finished.",
-  );
+        if (Array.isArray(response?.messages) && response.messages.length > 0) {
+          appendAssistantMessages(normalizeAssistantMessages(response.messages));
+        }
+
+        try {
+          await persistCurrentRuleConversation();
+        } catch (error) {
+          console.warn("Unable to persist the saved rule conversation.", error);
+          setError(
+            error instanceof Error
+              ? `The assistant finished, but the chat could not be saved: ${error.message}`
+              : "The assistant finished, but the chat could not be saved.",
+          );
+        }
+      },
+      "Vibe Pilot is working...",
+      "Assistant finished.",
+    );
+  } finally {
+    clearActiveAssistantTurn();
+    renderChatMessages();
+  }
 }
 
 async function cancelCurrentFlow() {
@@ -596,6 +714,7 @@ async function leaveSavedRule() {
   writeWorkspaceRule(EMPTY_WORKSPACE_RULE, {
     fileNames: createDefaultFileNames(),
   });
+  restoreAssistantConversation(null);
   clearChat();
   await persistCurrentFileNames();
   await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
@@ -615,7 +734,10 @@ async function applyCurrentRule(options = {}) {
   const previousRuleId = state.currentRuleId;
   const previousSnapshot = state.editingRuleSnapshot;
   const currentFileNames = normalizeFileNames(state.fileNames);
-  const response = await sendMessage("VIBE_PILOT_APPLY_DRAFT", rule);
+  const response = await sendMessage(
+    "VIBE_PILOT_APPLY_DRAFT",
+    createPersistableRule(rule),
+  );
 
   if (response?.rule) {
     upsertRule(response.rule);
@@ -635,6 +757,7 @@ async function applyCurrentRule(options = {}) {
     writeWorkspaceRule(response.rule, {
       fileNames: currentFileNames,
     });
+    restoreAssistantConversation(response.rule);
   } else {
     state.editingRuleSnapshot = previousSnapshot;
     writeWorkspaceRule(rule, {
@@ -753,6 +876,35 @@ function readWorkspaceRule() {
     javascript: elements.javascriptSnippet?.value ?? "",
     files: normalizeRuleFiles(serializeRuleFiles(state.ruleFiles)),
   };
+}
+
+function createPersistableRule(rule = readWorkspaceRule()) {
+  return {
+    ...createRuleSnapshot(rule),
+    ...readAssistantConversationSnapshot(),
+  };
+}
+
+function readAssistantConversationSnapshot() {
+  return {
+    chatMessages: normalizeAssistantMessages(state.assistantMessages),
+    chatPreviousResponseId: normalizeAssistantResponseId(
+      state.assistantPreviousResponseId,
+    ),
+  };
+}
+
+function normalizeAssistantResponseId(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function restoreAssistantConversation(rule) {
+  clearActiveAssistantTurn();
+  state.assistantMessages = normalizeAssistantMessages(rule?.chatMessages);
+  state.assistantPreviousResponseId = normalizeAssistantResponseId(
+    rule?.chatPreviousResponseId,
+  );
+  renderChatMessages();
 }
 
 function writeWorkspaceRule(rule, options = {}) {
@@ -1094,17 +1246,23 @@ function renderRulesList(rules) {
 }
 
 async function openRuleEditor(ruleId, options = {}) {
-  const rule = state.rules.find((item) => item.id === ruleId);
-  if (!rule) {
+  const ruleSummary = state.rules.find((item) => item.id === ruleId);
+  if (!ruleSummary) {
     setError("That rule could not be found.");
     return;
   }
 
+  const detail = await sendMessage("VIBE_PILOT_GET_RULE", {
+    ruleId,
+  });
+  const rule = detail?.rule ? createRuleSnapshot(detail.rule) : ruleSummary;
   const fileNames = resolveFileNamesForRuleId(rule.id);
   state.editingRuleSnapshot = createEditorSnapshot(rule, fileNames);
+  upsertRule(rule);
   writeWorkspaceRule(rule, {
     fileNames,
   });
+  restoreAssistantConversation(rule);
   switchCreateMode("files");
   switchActiveFile("html");
   clearChat();
@@ -1186,10 +1344,8 @@ function toggleBusy(isBusy) {
   const buttons = [
     elements.applyDraftButton,
     elements.cancelButton,
-    elements.chatClearButton,
     elements.chatSendButton,
-    elements.fileComposerCancel,
-    elements.fileComposerSave,
+    elements.chatUploadButton,
     elements.fileCreateButton,
     elements.leaveEditButton,
     elements.loadExampleButton,
@@ -1207,6 +1363,7 @@ function toggleBusy(isBusy) {
   });
 
   [
+    elements.chatImageInput,
     elements.chatInput,
     elements.cssSnippet,
     elements.htmlSnippet,
@@ -1231,7 +1388,9 @@ function toggleBusy(isBusy) {
 function syncWorkspaceState() {
   const rule = readWorkspaceRule();
   const applyReady = Boolean(rule.name) && hasRuleContent(rule);
-
+  const canSendAssistantMessage = hasPendingAssistantComposerContent();
+  const chatAttachmentLimitReached =
+    state.pendingChatImages.length >= CHAT_IMAGE_ATTACHMENT_LIMIT;
   if (elements.applyDraftButton) {
     elements.applyDraftButton.disabled = state.isBusy || !applyReady;
   }
@@ -1246,10 +1405,19 @@ function syncWorkspaceState() {
     elements.leaveEditButton.classList.toggle("is-hidden", !isEditingSavedRule());
   }
 
-  if (elements.chatClearButton) {
-    elements.chatClearButton.disabled =
-      state.isBusy ||
-      (state.assistantMessages.length === 0 && !state.assistantPreviousResponseId);
+  if (elements.chatSendButton) {
+    elements.chatSendButton.disabled = state.isBusy || !canSendAssistantMessage;
+  }
+
+  if (elements.chatUploadButton) {
+    elements.chatUploadButton.disabled = state.isBusy || chatAttachmentLimitReached;
+    elements.chatUploadButton.title = chatAttachmentLimitReached
+      ? `You can attach up to ${CHAT_IMAGE_ATTACHMENT_LIMIT} images per message.`
+      : "Add an image from your computer";
+  }
+
+  if (elements.chatImageInput) {
+    elements.chatImageInput.disabled = state.isBusy || chatAttachmentLimitReached;
   }
 }
 
@@ -1257,15 +1425,280 @@ function clearChat() {
   if (elements.chatInput) {
     elements.chatInput.value = "";
   }
+  clearPendingChatImages();
   autoResizeChat();
 }
 
-function resetAssistantConversation() {
-  state.assistantMessages = [];
-  state.assistantPreviousResponseId = null;
-  renderChatMessages();
-  clearChat();
-  setStatus("Chat cleared.");
+function clearActiveAssistantTurn() {
+  state.assistantTurnInProgress = false;
+  state.assistantTurnStartMessageId = null;
+}
+
+function hasPendingAssistantComposerContent() {
+  return Boolean(
+    state.pendingChatImages.length || (elements.chatInput?.value.trim() ?? ""),
+  );
+}
+
+function clearPendingChatImages() {
+  if (!state.pendingChatImages.length && !elements.chatImageInput?.value) {
+    return;
+  }
+
+  state.pendingChatImages = [];
+  if (elements.chatImageInput) {
+    elements.chatImageInput.value = "";
+  }
+  renderPendingChatImages();
+}
+
+function removePendingChatImage(imageId) {
+  const nextImages = state.pendingChatImages.filter((image) => image.id !== imageId);
+  if (nextImages.length === state.pendingChatImages.length) {
+    return;
+  }
+
+  state.pendingChatImages = nextImages;
+  renderPendingChatImages();
+}
+
+function renderPendingChatImages() {
+  if (!elements.chatAttachments) {
+    return;
+  }
+
+  if (!state.pendingChatImages.length) {
+    elements.chatAttachments.classList.add("is-hidden");
+    elements.chatAttachments.innerHTML = "";
+    syncWorkspaceState();
+    return;
+  }
+
+  elements.chatAttachments.classList.remove("is-hidden");
+  elements.chatAttachments.innerHTML = state.pendingChatImages
+    .map((image) => `
+      <div class="chat-composer-attachment">
+        <div class="chat-composer-chip">
+          <button
+            class="chat-composer-chip-preview"
+            type="button"
+            data-preview-chat-image-id="${escapeHtml(image.id)}"
+            aria-label="Preview ${escapeHtml(image.label)}"
+            title="Preview ${escapeHtml(image.label)}"
+          >
+            <span class="chat-composer-chip-thumb">
+              <img
+                class="chat-composer-chip-image"
+                src="${escapeHtml(image.url)}"
+                alt="${escapeHtml(image.alt)}"
+              />
+            </span>
+            <span class="chat-composer-chip-label">${escapeHtml(image.label)}</span>
+          </button>
+          <button
+            class="icon-button chat-composer-chip-remove"
+            type="button"
+            data-remove-chat-image-id="${escapeHtml(image.id)}"
+            aria-label="Remove ${escapeHtml(image.label)}"
+            title="Remove ${escapeHtml(image.label)}"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M4 4l8 8M12 4l-8 8"
+                fill="none"
+                stroke="currentColor"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                stroke-width="1.4"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+    `)
+    .join("");
+  syncWorkspaceState();
+}
+
+async function addPendingChatImages(files, options = {}) {
+  const imageFiles = files.filter((file) => isSupportedChatImageFile(file));
+  if (!imageFiles.length) {
+    if (files.length) {
+      setError("Only image files can be attached in chat.");
+    }
+    return;
+  }
+
+  const remainingSlots = CHAT_IMAGE_ATTACHMENT_LIMIT - state.pendingChatImages.length;
+  if (remainingSlots <= 0) {
+    setError(`You can attach up to ${CHAT_IMAGE_ATTACHMENT_LIMIT} images per message.`);
+    return;
+  }
+
+  const selectedFiles = imageFiles.slice(0, remainingSlots);
+  if (selectedFiles.length < imageFiles.length) {
+    setError(`Only the first ${CHAT_IMAGE_ATTACHMENT_LIMIT} images were kept for this message.`);
+  } else {
+    setError("");
+  }
+
+  try {
+    const attachments = await Promise.all(
+      selectedFiles.map((file, index) =>
+        createPendingChatImage(file, {
+          index,
+          source: options.source,
+        }),
+      ),
+    );
+    state.pendingChatImages = [...state.pendingChatImages, ...attachments];
+    renderPendingChatImages();
+  } catch (error) {
+    setError(
+      error instanceof Error
+        ? error.message
+        : "That image could not be attached to the chat.",
+    );
+  }
+}
+
+async function createPendingChatImage(file, options = {}) {
+  const sourceLabel =
+    typeof file.name === "string" && file.name.trim()
+      ? file.name.trim()
+      : options.source === "clipboard"
+        ? `Pasted screenshot ${options.index + 1}`
+        : options.source === "drop"
+          ? `Dropped screenshot ${options.index + 1}`
+        : `Image ${options.index + 1}`;
+  const dataUrl = await readBlobAsDataUrl(file);
+  const optimizedDataUrl = await optimizeChatImageDataUrl(dataUrl);
+
+  nextChatImageId += 1;
+
+  return {
+    alt: sourceLabel,
+    detail: "auto",
+    id: `chat-image-${nextChatImageId}`,
+    label: sourceLabel,
+    url: optimizedDataUrl,
+  };
+}
+
+function readBlobAsDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => {
+      reject(new Error("The selected image could not be read."));
+    };
+    reader.onload = () => {
+      resolve(typeof reader.result === "string" ? reader.result : "");
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function optimizeChatImageDataUrl(dataUrl) {
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
+    return dataUrl;
+  }
+
+  try {
+    const image = await loadImageElement(dataUrl);
+    const scale = Math.min(
+      1,
+      CHAT_IMAGE_MAX_EDGE / Math.max(1, image.naturalWidth),
+      CHAT_IMAGE_MAX_EDGE / Math.max(1, image.naturalHeight),
+    );
+
+    if (scale === 1 && dataUrl.length <= CHAT_IMAGE_INLINE_MAX_LENGTH) {
+      return dataUrl;
+    }
+
+    const width = Math.max(1, Math.round(image.naturalWidth * scale));
+    const height = Math.max(1, Math.round(image.naturalHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+
+    const context = canvas.getContext("2d");
+    if (!context) {
+      return dataUrl;
+    }
+
+    context.drawImage(image, 0, 0, width, height);
+    return canvas.toDataURL("image/jpeg", CHAT_IMAGE_PREVIEW_QUALITY);
+  } catch (error) {
+    console.warn("Unable to optimize an uploaded chat image.", error);
+    return dataUrl;
+  }
+}
+
+function loadImageElement(src) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => {
+      reject(new Error("The selected image could not be decoded."));
+    };
+    image.src = src;
+  });
+}
+
+function getClipboardImageFiles(clipboardData) {
+  if (!clipboardData?.items?.length) {
+    return [];
+  }
+
+  return Array.from(clipboardData.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file) => file instanceof File && isSupportedChatImageFile(file));
+}
+
+function hasImageDataTransfer(dataTransfer) {
+  return getDataTransferImageFiles(dataTransfer).length > 0;
+}
+
+function getDataTransferImageFiles(dataTransfer) {
+  const fileList = Array.isArray(dataTransfer?.files)
+    ? dataTransfer.files
+    : Array.from(dataTransfer?.files ?? []);
+  const directFiles = fileList.filter((file) => isSupportedChatImageFile(file));
+  const itemFiles = Array.from(dataTransfer?.items ?? [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file) => file instanceof File && isSupportedChatImageFile(file));
+
+  const deduped = new Map();
+  [...directFiles, ...itemFiles].forEach((file) => {
+    const key = [
+      file.name,
+      file.size,
+      file.type,
+      file.lastModified,
+    ].join(":");
+    if (!deduped.has(key)) {
+      deduped.set(key, file);
+    }
+  });
+
+  return Array.from(deduped.values());
+}
+
+function isSupportedChatImageFile(file) {
+  if (!(file instanceof File)) {
+    return false;
+  }
+
+  if (typeof file.type === "string" && file.type.startsWith("image/")) {
+    return true;
+  }
+
+  return (
+    typeof file.name === "string" &&
+    IMAGE_FILE_NAME_PATTERN.test(file.name.trim())
+  );
 }
 
 function appendAssistantMessages(messages) {
@@ -1300,6 +1733,10 @@ function appendAssistantMessages(messages) {
 }
 
 function normalizeAssistantMessages(messages) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+
   return messages
     .map((message) => ({
       createdAt:
@@ -1376,23 +1813,121 @@ function renderChatMessages() {
   }
 
   if (!state.assistantMessages.length) {
-    elements.chatPanel?.classList.add("is-empty");
-    elements.chatMessages.classList.add("is-empty");
     elements.chatMessages.innerHTML = "";
     syncWorkspaceState();
     return;
   }
 
-  elements.chatPanel?.classList.remove("is-empty");
-  elements.chatMessages.classList.remove("is-empty");
-  elements.chatMessages.innerHTML = groupAssistantMessages(state.assistantMessages)
-    .map((block) => renderTranscriptBlock(block))
+  elements.chatMessages.innerHTML = partitionTranscriptTurns(state.assistantMessages)
+    .map((turn) => renderTranscriptTurn(turn))
     .join("");
   elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
   syncWorkspaceState();
 }
 
-function groupAssistantMessages(messages) {
+function partitionTranscriptTurns(messages) {
+  const turns = [];
+  let currentTurn = null;
+
+  const flushTurn = () => {
+    if (!currentTurn?.messages.length) {
+      return;
+    }
+
+    turns.push(currentTurn);
+    currentTurn = null;
+  };
+
+  for (const message of messages) {
+    if (message.role === "user") {
+      flushTurn();
+      currentTurn = {
+        messages: [message],
+        startMessageId: message.id,
+        type: "turn",
+      };
+      continue;
+    }
+
+    if (!currentTurn) {
+      currentTurn = {
+        messages: [message],
+        startMessageId: null,
+        type: "loose",
+      };
+      continue;
+    }
+
+    currentTurn.messages.push(message);
+  }
+
+  flushTurn();
+  return turns;
+}
+
+function renderTranscriptTurn(turn) {
+  const isActiveTurn = Boolean(
+    state.assistantTurnInProgress &&
+    state.assistantTurnStartMessageId &&
+    turn.type === "turn" &&
+    turn.startMessageId === state.assistantTurnStartMessageId,
+  );
+
+  if (isActiveTurn) {
+    return renderMessageSequence(turn.messages, {
+      compactToolCalls: false,
+    });
+  }
+
+  if (turn.type !== "turn") {
+    return renderMessageSequence(turn.messages);
+  }
+
+  return renderCompletedTranscriptTurn(turn.messages);
+}
+
+function renderCompletedTranscriptTurn(messages) {
+  const userMessages = messages.filter((message) => message.role === "user");
+  const assistantMessages = messages.filter((message) => message.role === "assistant");
+  const toolMessages = messages.filter((message) => message.role === "tool");
+  const finalAssistantMessage = buildCompletedAssistantMessage(
+    assistantMessages,
+    toolMessages,
+  );
+  const parts = userMessages.map((message) => renderChatMessage(message));
+
+  if (finalAssistantMessage) {
+    parts.push(
+      toolMessages.length > 0
+        ? renderAssistantTurn(finalAssistantMessage, toolMessages)
+        : renderChatMessage(finalAssistantMessage),
+    );
+    return parts.join("");
+  }
+
+  if (toolMessages.length > 0) {
+    parts.push(renderToolThread(toolMessages));
+  }
+
+  return parts.join("");
+}
+
+function renderMessageSequence(messages, options = {}) {
+  return groupAssistantMessages(messages, options)
+    .map((block) => renderTranscriptBlock(block))
+    .join("");
+}
+
+function groupAssistantMessages(messages, options = {}) {
+  const compactToolCalls = options.compactToolCalls !== false;
+
+  if (!compactToolCalls) {
+    return messages.map((message) => ({
+      message,
+      type: "message",
+    }));
+  }
+
   const blocks = [];
   let toolMessages = [];
 
@@ -1444,27 +1979,27 @@ function renderTranscriptBlock(block) {
     return renderAssistantTurn(block.message, block.toolMessages);
   }
 
+  if (block.message?.role === "tool") {
+    return renderLiveToolMessage(block.message);
+  }
+
   return renderChatMessage(block.message);
 }
 
 function renderAssistantTurn(message, toolMessages) {
-  const verificationImages = collectToolImages(toolMessages);
+  const verificationImages = collectVerificationImages(toolMessages);
   const latestImage =
     verificationImages.length > 0
       ? verificationImages[verificationImages.length - 1]
       : null;
-  const assistantMessage = latestImage
-    ? {
-        ...message,
-        images: [latestImage],
-      }
-    : message;
+  const assistantMessage = promoteVerificationImage(message, latestImage);
+  const hiddenImageUrls = latestImage ? new Set([latestImage.url]) : null;
 
   return `
     ${renderChatMessage(assistantMessage, {
         compactImages: Boolean(latestImage),
         toolMarkup: renderToolGroup(toolMessages, {
-          hideImages: verificationImages.length > 0,
+          hiddenImageUrls,
           nested: true,
         }),
       })}
@@ -1477,7 +2012,7 @@ function renderChatMessage(message, options = {}) {
     message.role === "user"
       ? "You"
       : message.role === "tool"
-        ? message.toolName || "Tool"
+        ? formatToolLabel(message.toolName) || "Tool"
         : "Vibe Pilot";
 
   metaBits.push(`<span>${escapeHtml(label)}</span>`);
@@ -1486,18 +2021,21 @@ function renderChatMessage(message, options = {}) {
     metaBits.push('<span class="chat-meta-pill chat-meta-pill-running">Streaming</span>');
   }
 
-  if (message.role === "tool" && message.status === "error") {
-    metaBits.push('<span class="chat-meta-pill chat-meta-pill-error">Tool error</span>');
+  if (message.role === "tool") {
+    metaBits.push(...renderToolMetaPills(message));
   }
 
+  const useCompactImages = Boolean(options.compactImages || message.role === "user");
   const imagesMarkup = Array.isArray(message.images) && message.images.length > 0
     ? renderImageCards(message.images, {
-        compact: Boolean(options.compactImages),
+        compact: useCompactImages,
       })
     : "";
   const messageRole = message.role === "user" ? "user" : "assistant";
   const avatarText = messageRole === "user" ? "ME" : "AI";
   const toolMarkup = typeof options.toolMarkup === "string" ? options.toolMarkup : "";
+  const argumentsMarkup =
+    message.role === "tool" ? renderToolArguments(message.toolArgumentsText) : "";
 
   return `
     <section class="chat-row chat-row-${messageRole}">
@@ -1505,11 +2043,18 @@ function renderChatMessage(message, options = {}) {
       <article class="chat-message chat-message-${escapeHtml(message.role)}">
         <div class="chat-message-meta">${metaBits.join("")}</div>
         ${message.text ? `<p class="chat-message-text">${formatMultilineText(message.text)}</p>` : ""}
-        ${imagesMarkup ? `<div class="chat-image-grid">${imagesMarkup}</div>` : ""}
+        ${imagesMarkup ? `<div class="chat-image-grid${
+          useCompactImages ? " chat-image-grid-compact" : ""
+        }">${imagesMarkup}</div>` : ""}
+        ${argumentsMarkup}
         ${toolMarkup}
       </article>
     </section>
   `;
+}
+
+function renderLiveToolMessage(message) {
+  return renderChatMessage(message);
 }
 
 function renderToolGroup(messages, options = {}) {
@@ -1519,7 +2064,7 @@ function renderToolGroup(messages, options = {}) {
     (count, message) => count + message.images.length,
     0,
   );
-  const shouldAutoOpen = hasError || hasRunning;
+  const shouldAutoOpen = options.autoOpen === true;
   const summaryCopy = [
     `${messages.length} command${messages.length === 1 ? "" : "s"}`,
     screenshotCount
@@ -1533,7 +2078,7 @@ function renderToolGroup(messages, options = {}) {
   const callMarkup = messages
     .map((message, index) =>
       renderToolCall(message, index, {
-        hideImages: options.hideImages,
+        hiddenImageUrls: options.hiddenImageUrls,
       }),
     )
     .join("");
@@ -1572,6 +2117,9 @@ function renderToolThread(messages) {
     <section class="chat-row chat-row-assistant">
       <span class="chat-avatar chat-avatar-assistant">AI</span>
       <article class="chat-message chat-message-assistant">
+        <div class="chat-message-meta">
+          <span>Vibe Pilot</span>
+        </div>
         ${renderToolGroup(messages, {
           nested: true,
         })}
@@ -1583,18 +2131,13 @@ function renderToolThread(messages) {
 function renderToolCall(message, index, options = {}) {
   const toolLabel = formatToolLabel(message.toolName) || "Tool";
   const argumentsMarkup = renderToolArguments(message.toolArgumentsText);
-  const imagesMarkup = options.hideImages ? "" : renderImageCards(message.images);
-  const metaPills = [];
-
-  if (message.images.length > 0) {
-    metaPills.push('<span class="chat-meta-pill chat-meta-pill-verified">Screenshot</span>');
-  }
-
-  if (message.status === "error") {
-    metaPills.push('<span class="chat-meta-pill chat-meta-pill-error">Error</span>');
-  } else if (message.status === "running") {
-    metaPills.push('<span class="chat-meta-pill chat-meta-pill-running">Running</span>');
-  }
+  const imagesToRender = Array.isArray(message.images)
+    ? message.images.filter((image) =>
+        !(options.hiddenImageUrls instanceof Set && options.hiddenImageUrls.has(image.url))
+      )
+    : [];
+  const imagesMarkup = imagesToRender.length > 0 ? renderImageCards(imagesToRender) : "";
+  const metaPills = renderToolMetaPills(message);
 
   return `
     <article class="chat-toolcall${message.status === "error" ? " is-error" : ""}">
@@ -1610,6 +2153,22 @@ function renderToolCall(message, index, options = {}) {
       ${argumentsMarkup}
     </article>
   `;
+}
+
+function renderToolMetaPills(message) {
+  const metaPills = [];
+
+  if (message.images.length > 0) {
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-verified">Screenshot</span>');
+  }
+
+  if (message.status === "error") {
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-error">Error</span>');
+  } else if (message.status === "running") {
+    metaPills.push('<span class="chat-meta-pill chat-meta-pill-running">Running</span>');
+  }
+
+  return metaPills;
 }
 
 function renderToolArguments(argumentsText) {
@@ -1638,6 +2197,72 @@ function collectToolImages(messages) {
     Array.isArray(message.images)
       ? message.images.filter((image) => typeof image?.url === "string" && image.url.trim())
       : [],
+  );
+}
+
+function collectVerificationImages(messages) {
+  if (!Array.isArray(messages) || !messages.length) {
+    return [];
+  }
+
+  return messages.flatMap((message) => {
+    if (message?.toolName !== "take_screenshot" || message?.status === "running") {
+      return [];
+    }
+
+    return Array.isArray(message.images)
+      ? message.images.filter((image) => typeof image?.url === "string" && image.url.trim())
+      : [];
+  });
+}
+
+function promoteVerificationImage(message, latestImage) {
+  if (!latestImage) {
+    return message;
+  }
+
+  const existingImages = Array.isArray(message?.images) ? message.images : [];
+  const hasImageAlready = existingImages.some((image) => image?.url === latestImage.url);
+
+  return {
+    ...message,
+    images: hasImageAlready ? existingImages : [...existingImages, latestImage],
+  };
+}
+
+function buildCompletedAssistantMessage(assistantMessages, toolMessages) {
+  if (Array.isArray(assistantMessages) && assistantMessages.length > 0) {
+    const textFirstMessages = assistantMessages.filter((message) =>
+      typeof message?.text === "string" && message.text.trim(),
+    );
+    const chosenMessage =
+      textFirstMessages.length > 0
+        ? textFirstMessages[textFirstMessages.length - 1]
+        : assistantMessages[assistantMessages.length - 1];
+
+    return chosenMessage.status === "streaming"
+      ? {
+          ...chosenMessage,
+          status: "ok",
+        }
+      : chosenMessage;
+  }
+
+  if (!Array.isArray(toolMessages) || !toolMessages.length) {
+    return null;
+  }
+
+  const verificationImages = collectVerificationImages(toolMessages);
+  const hasErrors = toolMessages.some((message) => message.status === "error");
+
+  return createAssistantMessage(
+    "assistant",
+    verificationImages.length > 0
+      ? "Completed the request and attached the verification screenshot."
+      : "Completed the request. See the toolcalls below for details.",
+    {
+      status: hasErrors ? "error" : "ok",
+    },
   );
 }
 
@@ -1840,7 +2465,10 @@ function formatToolArguments(argumentsText) {
 }
 
 async function syncDraftFromAssistant(rule) {
-  const nextRule = createRuleSnapshot(rule);
+  const nextRule = {
+    ...createRuleSnapshot(rule),
+    ...readAssistantConversationSnapshot(),
+  };
   const previousRuleId = state.currentRuleId;
   const currentFileNames = normalizeFileNames(state.fileNames);
 
@@ -1884,6 +2512,7 @@ function hasWorkInProgressDraft() {
   return Boolean(
     currentRule.name ||
       hasRuleContent(currentRule) ||
+      state.pendingChatImages.length > 0 ||
       (elements.chatInput?.value.trim() ?? ""),
   );
 }
@@ -1910,6 +2539,7 @@ async function loadFreshWorkspace(rule) {
   writeWorkspaceRule(rule, {
     fileNames: defaultFileNames,
   });
+  restoreAssistantConversation(null);
   switchActiveFile("html");
   clearChat();
 
@@ -1944,7 +2574,37 @@ function createRuleSnapshot(rule) {
     css: typeof rule?.css === "string" ? rule.css : "",
     javascript: typeof rule?.javascript === "string" ? rule.javascript : "",
     files: normalizeRuleFiles(rule?.files),
+    chatMessages: normalizeAssistantMessages(rule?.chatMessages),
+    chatPreviousResponseId: normalizeAssistantResponseId(
+      rule?.chatPreviousResponseId,
+    ),
   };
+}
+
+async function persistCurrentRuleConversation() {
+  if (!state.currentRuleId) {
+    return;
+  }
+
+  const rule = readWorkspaceRule();
+  if (!rule.name) {
+    return;
+  }
+
+  const currentFileNames = normalizeFileNames(state.fileNames);
+  const response = await sendMessage(
+    "VIBE_PILOT_SAVE_RULE",
+    createPersistableRule(rule),
+  );
+
+  if (!response?.rule) {
+    return;
+  }
+
+  const savedRule = createRuleSnapshot(response.rule);
+  upsertRule(savedRule);
+  state.editingRuleSnapshot = createEditorSnapshot(savedRule, currentFileNames);
+  restoreAssistantConversation(savedRule);
 }
 
 function resetEditSession() {
@@ -2294,6 +2954,10 @@ function createStateRuleFiles(value) {
 }
 
 function serializeRuleFiles(ruleFiles) {
+  if (!Array.isArray(ruleFiles)) {
+    return [];
+  }
+
   return ruleFiles.map((file) => ({
     content: typeof file?.content === "string" ? file.content : "",
     mimeType: typeof file?.mimeType === "string" ? file.mimeType : "",
