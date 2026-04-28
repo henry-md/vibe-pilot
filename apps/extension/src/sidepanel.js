@@ -13,37 +13,58 @@ const FILE_DEFINITIONS = [
     label: "HTML",
     defaultName: "index.html",
     extension: ".html",
-    starterTitle: "Markup",
-    placeholder: "hero-banner",
+    placeholder: "index",
   },
   {
     key: "css",
     label: "CSS",
     defaultName: "index.css",
     extension: ".css",
-    starterTitle: "Styles",
-    placeholder: "surface-theme",
+    placeholder: "index",
   },
   {
     key: "javascript",
     label: "JS",
     defaultName: "index.js",
     extension: ".js",
-    starterTitle: "Logic",
-    placeholder: "launch-state",
+    placeholder: "index",
   },
 ];
 
-const RED_TEXT_STARTER_LABEL = "Make Text Red";
 const FILE_LAYOUT_STORAGE_KEY = "vibePilotFileLayout";
+const STARTER_RULES = [
+  {
+    doneMessage: "Hello World starter applied.",
+    key: "hello-world",
+    pendingMessage: "Loading the Hello World starter...",
+    rule: DEFAULT_WORKSPACE_RULE,
+  },
+  {
+    doneMessage: "Red text starter applied.",
+    key: "red-text",
+    pendingMessage: "Loading the red text starter...",
+    rule: RED_TEXT_STARTER_WORKSPACE_RULE,
+  },
+];
+const CUSTOM_RULE_FILE_DEFAULT_PATH = "asset.txt";
+const FILE_RENAME_MEASURE_CANVAS = document.createElement("canvas");
+const CHAT_IMAGE_ATTACHMENT_LIMIT = 4;
+const CHAT_IMAGE_MAX_EDGE = 1400;
+const CHAT_IMAGE_PREVIEW_QUALITY = 0.82;
+const CHAT_IMAGE_INLINE_MAX_LENGTH = 2_000_000;
+const IMAGE_FILE_NAME_PATTERN = /\.(apng|avif|gif|heic|heif|jpe?g|png|svg|webp)$/i;
+let nextRuleFileId = 0;
+let nextChatImageId = 0;
 
 const state = {
   activeFile: "html",
+  activeCreateMode: "chat",
   assistantMessages: [],
   assistantProgressPort: null,
   assistantPreviousResponseId: null,
   activeTab: null,
   activeView: "create",
+  confirmModalResolver: null,
   currentRuleId: null,
   editingRuleSnapshot: null,
   fileLayout: createDefaultFileLayout(),
@@ -60,25 +81,36 @@ const elements = {
   activeFileTitle: document.querySelector("#active-file-title"),
   applyDraftButton: document.querySelector("#apply-draft-button"),
   cancelButton: document.querySelector("#cancel-button"),
-  chatClearButton: document.querySelector("#chat-clear-button"),
+  chatComposer: document.querySelector(".chat-composer"),
+  confirmModal: document.querySelector("#confirm-action-modal"),
+  confirmModalCancel: document.querySelector("#confirm-action-modal-cancel"),
+  confirmModalClose: document.querySelector("#confirm-action-modal-close"),
+  confirmModalConfirm: document.querySelector("#confirm-action-modal-confirm"),
+  confirmModalDescription: document.querySelector("#confirm-action-modal-description"),
+  confirmModalTitle: document.querySelector("#confirm-action-modal-title"),
+  createModePanels: Array.from(document.querySelectorAll("[data-create-mode-panel]")),
+  createModeTabs: Array.from(document.querySelectorAll("[data-create-mode-target]")),
+  chatPanel: document.querySelector(".chat-panel"),
   chatImageLightbox: document.querySelector("#chat-image-lightbox"),
   chatImageLightboxCaption: document.querySelector("#chat-image-lightbox-caption"),
   chatImageLightboxClose: document.querySelector("#chat-image-lightbox-close"),
   chatImageLightboxImage: document.querySelector("#chat-image-lightbox-image"),
+  chatImageLightboxTitle: document.querySelector("#chat-image-lightbox-title"),
+  chatClearButton: document.querySelector("#chat-clear-button"),
+  chatImageInput: document.querySelector("#chat-image-input"),
   chatInput: document.querySelector("#chat-input"),
   chatMessages: document.querySelector("#chat-messages"),
   chatSendButton: document.querySelector("#chat-send-button"),
   cssSnippet: document.querySelector("#css-snippet"),
   errorBanner: document.querySelector("#error-banner"),
-  fileComposer: document.querySelector("#file-tab-composer"),
-  fileComposerCancel: document.querySelector("#file-tab-composer-cancel"),
-  fileComposerHint: document.querySelector("#file-tab-composer-hint"),
-  fileComposerInput: document.querySelector("#file-tab-name-input"),
-  fileComposerMode: document.querySelector("#file-tab-composer-mode"),
-  fileComposerSave: document.querySelector("#file-tab-composer-save"),
   fileCreateButton: document.querySelector("#file-tab-create-button"),
-  fileEditButtons: Array.from(document.querySelectorAll("[data-file-edit-target]")),
+  fileTabStrip: document.querySelector(".file-tab-strip"),
   filePanels: Array.from(document.querySelectorAll("[data-file-panel]")),
+  fileRenameInputs: {
+    css: document.querySelector('[data-file-rename-input="css"]'),
+    html: document.querySelector('[data-file-rename-input="html"]'),
+    javascript: document.querySelector('[data-file-rename-input="javascript"]'),
+  },
   fileTabShells: Array.from(document.querySelectorAll("[data-file-shell]")),
   fileTabLabels: {
     css: document.querySelector('[data-file-tab-label="css"]'),
@@ -92,6 +124,7 @@ const elements = {
     javascript: document.querySelector('[data-file-panel-label="javascript"]'),
   },
   htmlSnippet: document.querySelector("#html-snippet"),
+  editorStack: document.querySelector(".editor-stack"),
   javascriptSnippet: document.querySelector("#javascript-snippet"),
   leaveEditButton: document.querySelector("#leave-edit-button"),
   loadExampleButton: document.querySelector("#load-example-button"),
@@ -115,6 +148,7 @@ async function boot() {
   connectAssistantProgressPort();
   setCurrentFileNames(resolveFileNamesForRuleId(null));
   switchActiveFile(state.activeFile);
+  switchCreateMode(state.activeCreateMode);
   switchView("create");
   autoResizeChat();
   renderChatMessages();
@@ -133,13 +167,43 @@ function wireEvents() {
     });
   });
 
-  elements.fileTabs.forEach((button) => {
+  elements.createModeTabs.forEach((button) => {
     button.addEventListener("click", () => {
-      const target = button.getAttribute("data-file-target");
+      const target = button.getAttribute("data-create-mode-target");
       if (target) {
-        switchActiveFile(target);
+        switchCreateMode(target);
       }
     });
+  });
+
+  elements.fileTabStrip?.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) {
+      return;
+    }
+
+    const createButton = target.closest("#file-tab-create-button");
+    if (createButton) {
+      createRuleFile();
+      return;
+    }
+
+    const fileButton = target.closest("[data-file-target]");
+    if (!(fileButton instanceof HTMLElement)) {
+      return;
+    }
+
+    const fileKey = fileButton.getAttribute("data-file-target");
+    if (!fileKey) {
+      return;
+    }
+
+    if (target.closest("[data-file-tab-label]")) {
+      openFileNamingSession(fileKey, "rename");
+      return;
+    }
+
+    switchActiveFile(fileKey);
   });
 
   [
@@ -154,35 +218,15 @@ function wireEvents() {
     });
   });
 
-  elements.fileCreateButton?.addEventListener("click", () => {
-    const nextFile = pickNextNameableFile();
-    if (nextFile) {
-      openFileNamingSession(nextFile, "create");
+  elements.fileTabStrip?.addEventListener("keydown", (event) => {
+    const renameInput = event.target instanceof Element
+      ? event.target.closest("[data-file-rename-input]")
+      : null;
+    if (!(renameInput instanceof HTMLTextAreaElement)) {
+      return;
     }
-  });
 
-  elements.fileEditButtons.forEach((button) => {
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-
-      const target = button.getAttribute("data-file-edit-target");
-      if (target) {
-        openFileNamingSession(target, "edit");
-      }
-    });
-  });
-
-  elements.fileComposerCancel?.addEventListener("click", () => {
-    closeFileNamingSession();
-  });
-
-  elements.fileComposerSave?.addEventListener("click", () => {
-    void commitFileNamingSession();
-  });
-
-  elements.fileComposerInput?.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
+    if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void commitFileNamingSession();
       return;
@@ -192,6 +236,56 @@ function wireEvents() {
       event.preventDefault();
       closeFileNamingSession();
     }
+  });
+
+  elements.fileTabStrip?.addEventListener("input", (event) => {
+    const renameInput = event.target instanceof Element
+      ? event.target.closest("[data-file-rename-input]")
+      : null;
+    if (!(renameInput instanceof HTMLTextAreaElement)) {
+      return;
+    }
+
+    const fileKey = renameInput.getAttribute("data-file-rename-input");
+    if (fileKey && state.fileNamingSession?.fileKey === fileKey) {
+      syncFileRenameWidth(fileKey);
+    }
+  });
+
+  elements.fileTabStrip?.addEventListener("focusout", (event) => {
+    const renameInput = event.target instanceof Element
+      ? event.target.closest("[data-file-rename-input]")
+      : null;
+    if (!(renameInput instanceof HTMLTextAreaElement)) {
+      return;
+    }
+
+    const fileKey = renameInput.getAttribute("data-file-rename-input");
+    if (fileKey && state.fileNamingSession?.fileKey === fileKey) {
+      closeFileNamingSession();
+    }
+  });
+
+  elements.editorStack?.addEventListener("input", (event) => {
+    const editor = event.target instanceof Element
+      ? event.target.closest("[data-rule-file-editor]")
+      : null;
+    if (!(editor instanceof HTMLTextAreaElement)) {
+      return;
+    }
+
+    const fileKey = editor.getAttribute("data-rule-file-editor");
+    if (!fileKey) {
+      return;
+    }
+
+    const ruleFile = getRuleFileByKey(fileKey);
+    if (!ruleFile) {
+      return;
+    }
+
+    ruleFile.content = editor.value;
+    syncWorkspaceState();
   });
 
   elements.chatInput?.addEventListener("input", () => {
@@ -250,6 +344,35 @@ function wireEvents() {
     closeChatImageLightbox();
   });
 
+  elements.confirmModalConfirm?.addEventListener("click", () => {
+    resolveConfirmModal(true);
+  });
+
+  elements.confirmModalCancel?.addEventListener("click", () => {
+    resolveConfirmModal(false);
+  });
+
+  elements.confirmModalClose?.addEventListener("click", () => {
+    resolveConfirmModal(false);
+  });
+
+  elements.confirmModal?.addEventListener("click", (event) => {
+    if (event.target === elements.confirmModal) {
+      resolveConfirmModal(false);
+    }
+  });
+
+  elements.confirmModal?.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    resolveConfirmModal(false);
+  });
+
+  elements.confirmModal?.addEventListener("close", () => {
+    if (state.confirmModalResolver) {
+      resolveConfirmModal(false);
+    }
+  });
+
   elements.newScaffoldInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -268,24 +391,12 @@ function wireEvents() {
   );
 
   elements.starterSuggestionButton?.addEventListener("click", () => {
-    void runAction(
-      async () => {
-        await loadFreshWorkspace(RED_TEXT_STARTER_WORKSPACE_RULE);
-      },
-      "Loading the red text starter...",
-      "Red text override ready.",
-    );
+    void handleStarterSelection("red-text");
   });
 
-  elements.loadExampleButton?.addEventListener("click", () =>
-    runAction(
-      async () => {
-        await loadFreshWorkspace(DEFAULT_WORKSPACE_RULE);
-      },
-      "Loading the Hello World example...",
-      "Hello World Pill loaded.",
-    ),
-  );
+  elements.loadExampleButton?.addEventListener("click", () => {
+    void handleStarterSelection("hello-world");
+  });
 
   elements.cancelButton?.addEventListener("click", () =>
     runAction(
@@ -406,7 +517,7 @@ async function createNamedScaffold(requestedNameOverride = "") {
     throw new Error("Type a name first.");
   }
 
-  if (!confirmReplacingDraft()) {
+  if (!(await confirmReplacingDraft())) {
     return;
   }
 
@@ -640,7 +751,7 @@ function readWorkspaceRule() {
     html: elements.htmlSnippet?.value ?? "",
     css: elements.cssSnippet?.value ?? "",
     javascript: elements.javascriptSnippet?.value ?? "",
-    files: normalizeRuleFiles(state.ruleFiles),
+    files: normalizeRuleFiles(serializeRuleFiles(state.ruleFiles)),
   };
 }
 
@@ -669,11 +780,12 @@ function writeWorkspaceRule(rule, options = {}) {
     elements.javascriptSnippet.value = rule?.javascript ?? "";
   }
 
-  state.ruleFiles = normalizeRuleFiles(rule?.files);
+  state.ruleFiles = createStateRuleFiles(rule?.files);
 
   setCurrentFileNames(
     options.fileNames ?? resolveFileNamesForRuleId(state.currentRuleId),
   );
+  ensureActiveFileIsValid();
   syncWorkspaceState();
 }
 
@@ -704,8 +816,32 @@ function switchView(nextView) {
   }
 }
 
+function switchCreateMode(nextMode) {
+  if (nextMode !== "chat" && nextMode !== "files") {
+    return;
+  }
+
+  state.activeCreateMode = nextMode;
+
+  if (nextMode !== "files" && state.fileNamingSession) {
+    closeFileNamingSession();
+  }
+
+  elements.createModeTabs.forEach((button) => {
+    const isActive = button.getAttribute("data-create-mode-target") === nextMode;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  });
+
+  elements.createModePanels.forEach((panel) => {
+    const isActive = panel.getAttribute("data-create-mode-panel") === nextMode;
+    panel.classList.toggle("is-active", isActive);
+    panel.classList.toggle("is-hidden", !isActive);
+  });
+}
+
 function switchActiveFile(nextFile, options = {}) {
-  if (!FILE_DEFINITIONS.some((file) => file.key === nextFile)) {
+  if (!isKnownFileKey(nextFile)) {
     return;
   }
 
@@ -718,70 +854,73 @@ function switchActiveFile(nextFile, options = {}) {
   }
 
   state.activeFile = nextFile;
-
-  elements.fileTabs.forEach((button) => {
-    const isActive = button.getAttribute("data-file-target") === nextFile;
-    button.classList.toggle("is-active", isActive);
-    button.setAttribute("aria-selected", String(isActive));
-  });
-
-  elements.filePanels.forEach((panel) => {
-    const isActive = panel.getAttribute("data-file-panel") === nextFile;
-    panel.classList.toggle("is-active", isActive);
-  });
-
   updateFileLabels();
 }
 
-function pickNextNameableFile() {
-  return FILE_DEFINITIONS.find((file) => isDefaultFileName(file.key))?.key ?? null;
-}
-
-function openFileNamingSession(fileKey, mode) {
-  const definition = getFileDefinition(fileKey);
-  if (
-    !definition ||
-    !elements.fileComposer ||
-    !elements.fileComposerInput ||
-    !elements.fileComposerMode ||
-    !elements.fileComposerHint
-  ) {
+function openFileNamingSession(fileKey, mode, options = {}) {
+  if (!isKnownFileKey(fileKey)) {
     return;
   }
 
+  if (state.fileNamingSession && state.fileNamingSession.fileKey !== fileKey) {
+    closeFileNamingSession();
+  }
+
+  const previousActiveFile = state.activeFile;
+
   switchActiveFile(fileKey, { preserveComposer: true });
+  const renameInput = getFileRenameInput(fileKey);
+  if (!renameInput) {
+    return;
+  }
+
   state.fileNamingSession = {
     fileKey,
+    minimumWidth: Math.ceil(getFileTabButton(fileKey)?.getBoundingClientRect().width ?? 0),
     mode,
+    returnFileKey: options.returnFileKey ?? previousActiveFile,
   };
 
-  elements.fileComposer.classList.remove("is-hidden");
-  elements.fileComposerMode.textContent =
-    mode === "create" ? `Name ${definition.label} file` : `Rename ${definition.label} file`;
-  elements.fileComposerHint.textContent =
-    mode === "create"
-      ? `Give the ${definition.label} starter tab a production-ready name.`
-      : `Rename this ${definition.label} tab without changing its code slot.`;
-  elements.fileComposerInput.placeholder = definition.placeholder;
-  elements.fileComposerInput.value = getEditableFileName(fileKey);
+  renameInput.placeholder = getFileRenamePlaceholder(fileKey);
+  renameInput.value = getEditableFileName(fileKey);
 
   renderFileTabState();
+  syncFileRenameWidth(fileKey);
 
   requestAnimationFrame(() => {
-    elements.fileComposerInput?.focus();
-    elements.fileComposerInput?.select();
+    renameInput.focus();
+    renameInput.select();
   });
 }
 
-function closeFileNamingSession() {
+function closeFileNamingSession(options = {}) {
+  const session = state.fileNamingSession;
+  const activeFileKey = session?.fileKey;
   state.fileNamingSession = null;
-  elements.fileComposer?.classList.add("is-hidden");
 
-  if (elements.fileComposerInput) {
-    elements.fileComposerInput.value = "";
+  if (activeFileKey) {
+    const renameInput = getFileRenameInput(activeFileKey);
+    if (renameInput) {
+      renameInput.value = "";
+    }
+  }
+
+  if (
+    session?.mode === "create" &&
+    isCustomFileKey(session.fileKey) &&
+    !options.keepCreatedFile
+  ) {
+    removeRuleFileByKey(session.fileKey);
+
+    if (session.returnFileKey && isKnownFileKey(session.returnFileKey)) {
+      switchActiveFile(session.returnFileKey, { preserveComposer: true });
+    } else {
+      switchActiveFile("html", { preserveComposer: true });
+    }
   }
 
   renderFileTabState();
+  syncWorkspaceState();
 }
 
 async function commitFileNamingSession() {
@@ -789,18 +928,56 @@ async function commitFileNamingSession() {
     return;
   }
 
-  const definition = getFileDefinition(state.fileNamingSession.fileKey);
-  if (!definition || !elements.fileComposerInput) {
+  const session = state.fileNamingSession;
+  const fileKey = state.fileNamingSession.fileKey;
+  const definition = getFileDefinition(fileKey);
+  const renameInput = getFileRenameInput(fileKey);
+  if (!renameInput) {
     return;
   }
 
-  state.fileNames[state.fileNamingSession.fileKey] = normalizeSingleFileName(
-    elements.fileComposerInput.value,
-    definition,
-  );
-  closeFileNamingSession();
+  if (definition) {
+    state.fileNames[fileKey] = normalizeSingleFileName(
+      renameInput.value,
+      definition,
+    );
+  } else {
+    const ruleFile = getRuleFileByKey(fileKey);
+    if (!ruleFile) {
+      return;
+    }
+
+    const requestedPath = String(renameInput.value ?? "").trim();
+    if (!requestedPath) {
+      deleteCustomRuleFile(session);
+      return;
+    }
+
+    const nextPath = normalizeCustomFilePath(requestedPath);
+    const hasDuplicatePath = state.ruleFiles.some(
+      (candidate) =>
+        candidate.id !== ruleFile.id &&
+        normalizeCustomFilePath(candidate.path).toLowerCase() === nextPath.toLowerCase(),
+    );
+    if (hasDuplicatePath) {
+      setError(`"${nextPath}" already exists. Choose a different file name.`);
+      renameInput.focus();
+      renameInput.select();
+      return;
+    }
+
+    setError("");
+    ruleFile.path = nextPath;
+    ruleFile.mimeType = inferRuleFileMimeType(nextPath);
+  }
+
+  closeFileNamingSession({ keepCreatedFile: true });
   updateFileLabels();
-  await persistCurrentFileNames();
+  if (definition) {
+    await persistCurrentFileNames();
+  } else {
+    syncWorkspaceState();
+  }
 }
 
 async function loadRules() {
@@ -809,6 +986,60 @@ async function loadRules() {
     ? payload.rules.map((rule) => createRuleSnapshot(rule))
     : [];
   renderRulesList(state.rules);
+}
+
+async function handleStarterSelection(starterKey) {
+  const starter = getStarterRule(starterKey);
+  if (!starter) {
+    return;
+  }
+
+  await runAction(
+    async () => {
+      const rule = await saveStarterRule(starterKey);
+      if (!rule?.id) {
+        throw new Error("The starter rule could not be opened.");
+      }
+
+      await openRuleEditor(rule.id, {
+        applyOnOpen: true,
+      });
+    },
+    starter.pendingMessage,
+    starter.doneMessage,
+  );
+}
+
+async function saveStarterRule(starterKey) {
+  const starter = getStarterRule(starterKey);
+  if (!starter) {
+    throw new Error("That starter could not be found.");
+  }
+
+  const existingRule = state.rules.find((rule) =>
+    normalizeStarterName(rule.name) === normalizeStarterName(starter.rule.name),
+  );
+  if (existingRule) {
+    return existingRule;
+  }
+
+  const preservedDraft = readWorkspaceRule();
+  const response = await sendMessage("VIBE_PILOT_SAVE_RULE", starter.rule);
+  const savedRule = response?.rule ? createRuleSnapshot(response.rule) : null;
+
+  if (!savedRule) {
+    throw new Error("The starter could not be saved.");
+  }
+
+  upsertRule(savedRule);
+
+  if (savedRule.id) {
+    saveRuleFileNames(savedRule.id, createDefaultFileNames());
+    await saveFileLayout();
+  }
+
+  await sendMessage("VIBE_PILOT_SAVE_DRAFT", preservedDraft);
+  return savedRule;
 }
 
 function renderRulesList(rules) {
@@ -874,6 +1105,7 @@ async function openRuleEditor(ruleId, options = {}) {
   writeWorkspaceRule(rule, {
     fileNames,
   });
+  switchCreateMode("files");
   switchActiveFile("html");
   clearChat();
   switchView("create");
@@ -894,7 +1126,14 @@ async function deleteRuleFromList(ruleId) {
   const rule = state.rules.find((item) => item.id === ruleId);
   const ruleName = rule?.name ?? "this rule";
 
-  if (!window.confirm(`Delete "${ruleName}"?`)) {
+  const confirmed = await showConfirmModal({
+    confirmLabel: "Delete rule",
+    description: `This will permanently remove "${ruleName}" from your saved rules.`,
+    tone: "destructive",
+    title: `Delete "${ruleName}"?`,
+  });
+
+  if (!confirmed) {
     return;
   }
 
@@ -956,8 +1195,8 @@ function toggleBusy(isBusy) {
     elements.loadExampleButton,
     elements.scaffoldRuleButton,
     elements.starterSuggestionButton,
-    ...elements.fileEditButtons,
-    ...elements.fileTabs,
+    ...elements.createModeTabs,
+    ...getFileTabButtons(),
     ...elements.viewTabs,
   ];
 
@@ -970,12 +1209,13 @@ function toggleBusy(isBusy) {
   [
     elements.chatInput,
     elements.cssSnippet,
-    elements.fileComposerInput,
     elements.htmlSnippet,
     elements.javascriptSnippet,
     elements.matchPattern,
     elements.newScaffoldInput,
     elements.ruleName,
+    ...getFileRenameInputs(),
+    ...getRuleFileEditors(),
   ].forEach((field) => {
     if (field) {
       field.disabled = isBusy;
@@ -993,7 +1233,7 @@ function syncWorkspaceState() {
   const applyReady = Boolean(rule.name) && hasRuleContent(rule);
 
   if (elements.applyDraftButton) {
-    elements.applyDraftButton.disabled = !applyReady;
+    elements.applyDraftButton.disabled = state.isBusy || !applyReady;
   }
 
   if (elements.ruleModeLabel) {
@@ -1439,6 +1679,108 @@ function renderImageCards(images, options = {}) {
     .join("");
 }
 
+function showPopupModal(dialog, options = {}) {
+  if (!(dialog instanceof HTMLDialogElement)) {
+    return;
+  }
+
+  dialog.__returnFocusTarget =
+    document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
+  if (typeof dialog.showModal === "function") {
+    if (!dialog.open) {
+      dialog.showModal();
+    }
+  } else {
+    dialog.setAttribute("open", "open");
+  }
+
+  if (options.initialFocus instanceof HTMLElement) {
+    window.requestAnimationFrame(() => {
+      options.initialFocus.focus({
+        preventScroll: true,
+      });
+    });
+  }
+}
+
+function hidePopupModal(dialog) {
+  if (!(dialog instanceof HTMLDialogElement)) {
+    return;
+  }
+
+  const returnFocusTarget =
+    dialog.__returnFocusTarget instanceof HTMLElement ? dialog.__returnFocusTarget : null;
+  dialog.__returnFocusTarget = null;
+
+  if (typeof dialog.close === "function") {
+    if (dialog.open) {
+      dialog.close();
+    }
+  } else {
+    dialog.removeAttribute("open");
+  }
+
+  if (returnFocusTarget?.isConnected) {
+    window.requestAnimationFrame(() => {
+      returnFocusTarget.focus({
+        preventScroll: true,
+      });
+    });
+  }
+}
+
+function showConfirmModal({
+  cancelLabel = "Cancel",
+  confirmLabel = "Continue",
+  description = "",
+  title = "Are you sure?",
+  tone = "default",
+} = {}) {
+  if (!elements.confirmModal || !elements.confirmModalConfirm) {
+    return Promise.resolve(false);
+  }
+
+  if (state.confirmModalResolver) {
+    resolveConfirmModal(false);
+  }
+
+  if (elements.confirmModalTitle) {
+    elements.confirmModalTitle.textContent = title;
+  }
+
+  if (elements.confirmModalDescription) {
+    elements.confirmModalDescription.textContent = description;
+  }
+
+  if (elements.confirmModalCancel) {
+    elements.confirmModalCancel.textContent = cancelLabel;
+  }
+
+  elements.confirmModalConfirm.textContent = confirmLabel;
+  elements.confirmModalConfirm.dataset.tone = tone;
+
+  showPopupModal(elements.confirmModal, {
+    initialFocus: elements.confirmModalConfirm,
+  });
+
+  return new Promise((resolve) => {
+    state.confirmModalResolver = resolve;
+  });
+}
+
+function resolveConfirmModal(confirmed) {
+  if (!state.confirmModalResolver) {
+    hidePopupModal(elements.confirmModal);
+    return;
+  }
+
+  const resolve = state.confirmModalResolver;
+  state.confirmModalResolver = null;
+  hidePopupModal(elements.confirmModal);
+  resolve(Boolean(confirmed));
+}
+
 function openChatImageLightbox(image) {
   if (!elements.chatImageLightbox || !elements.chatImageLightboxImage) {
     return;
@@ -1447,31 +1789,26 @@ function openChatImageLightbox(image) {
   elements.chatImageLightboxImage.src = image.url;
   elements.chatImageLightboxImage.alt = image.alt || "Expanded screenshot";
 
+  if (elements.chatImageLightboxTitle) {
+    elements.chatImageLightboxTitle.textContent =
+      image.label || image.alt || "Expanded preview";
+  }
+
   if (elements.chatImageLightboxCaption) {
     elements.chatImageLightboxCaption.textContent =
       image.label || image.alt || "Screenshot";
   }
 
-  if (typeof elements.chatImageLightbox.showModal === "function") {
-    if (!elements.chatImageLightbox.open) {
-      elements.chatImageLightbox.showModal();
-    }
-  } else {
-    elements.chatImageLightbox.setAttribute("open", "open");
-  }
+  showPopupModal(elements.chatImageLightbox, {
+    initialFocus: elements.chatImageLightboxClose,
+  });
 }
 
 function closeChatImageLightbox() {
-  if (!elements.chatImageLightbox) {
-    return;
-  }
+  hidePopupModal(elements.chatImageLightbox);
 
-  if (typeof elements.chatImageLightbox.close === "function") {
-    if (elements.chatImageLightbox.open) {
-      elements.chatImageLightbox.close();
-    }
-  } else {
-    elements.chatImageLightbox.removeAttribute("open");
+  if (elements.chatImageLightboxImage) {
+    elements.chatImageLightboxImage.removeAttribute("src");
   }
 }
 
@@ -1551,11 +1888,17 @@ function hasWorkInProgressDraft() {
   );
 }
 
-function confirmReplacingDraft() {
-  return (
-    !hasWorkInProgressDraft() ||
-    window.confirm("Start a fresh scaffold and replace the current draft?")
-  );
+async function confirmReplacingDraft() {
+  if (!hasWorkInProgressDraft()) {
+    return true;
+  }
+
+  return showConfirmModal({
+    confirmLabel: "Replace draft",
+    description:
+      "This will clear the current draft in the editor and start a fresh scaffold instead.",
+    title: "Replace your current draft?",
+  });
 }
 
 async function loadFreshWorkspace(rule) {
@@ -1648,65 +1991,90 @@ function setCurrentFileNames(fileNames) {
 }
 
 function updateFileLabels() {
+  renderRuleFiles();
+
   FILE_DEFINITIONS.forEach((file) => {
-    const displayName = getDisplayFileName(file.key);
-    const tabLabel = elements.fileTabLabels[file.key];
-    const panelLabel = elements.filePanelLabels[file.key];
-    const tabButton = elements.fileTabs.find(
-      (button) => button.getAttribute("data-file-target") === file.key,
-    );
-    const editButton = elements.fileEditButtons.find(
-      (button) => button.getAttribute("data-file-edit-target") === file.key,
-    );
+    const tabDisplayName = getTabDisplayFileName(file.key);
+    const tabLabel = getFileTabLabel(file.key);
+    const panelLabel = getFilePanelLabel(file.key);
+    const tabButton = getFileTabButton(file.key);
     const actualFileName = state.fileNames[file.key] ?? file.defaultName;
 
     if (tabLabel) {
-      tabLabel.textContent = displayName;
+      tabLabel.textContent = tabDisplayName;
     }
 
     if (panelLabel) {
-      panelLabel.textContent = displayName;
+      panelLabel.textContent = getEditorFileMarker(file.key);
     }
 
     if (tabButton) {
       tabButton.title = `${file.label} slot · ${actualFileName}`;
     }
-
-    if (editButton) {
-      editButton.title = `Rename ${displayName}`;
-      editButton.setAttribute("aria-label", `Rename ${displayName}`);
-    }
   });
 
-  if (elements.activeFileTitle) {
-    elements.activeFileTitle.textContent = getDisplayFileName(state.activeFile);
-  }
+  state.ruleFiles.forEach((file) => {
+    const fileKey = getRuleFileKey(file.id);
+    const tabLabel = getFileTabLabel(fileKey);
+    const panelLabel = getFilePanelLabel(fileKey);
+    const tabButton = getFileTabButton(fileKey);
+    const displayName = getDisplayFileName(fileKey);
+
+    if (tabLabel) {
+      tabLabel.textContent = getTabDisplayFileName(fileKey);
+    }
+
+    if (panelLabel) {
+      panelLabel.textContent = getEditorFileMarker(fileKey);
+    }
+
+    if (tabButton) {
+      tabButton.title = `Generated file · ${displayName}`;
+    }
+  });
 
   renderFileTabState();
 }
 
 function getDisplayFileName(fileKey) {
   const definition = getFileDefinition(fileKey);
-  if (!definition) {
-    return "";
+  if (definition) {
+    return formatVisibleFileName(
+      normalizeSingleFileName(state.fileNames[fileKey], definition),
+    );
   }
 
-  const normalizedFileName = normalizeSingleFileName(
-    state.fileNames[fileKey],
-    definition,
-  );
+  const ruleFile = getRuleFileByKey(fileKey);
+  return ruleFile ? formatVisibleFileName(ruleFile.path) : "";
+}
 
-  if (normalizedFileName === definition.defaultName) {
-    return definition.starterTitle;
+function getTabDisplayFileName(fileKey) {
+  return abbreviateTabLabel(getDisplayFileName(fileKey));
+}
+
+function getEditorFileMarker(fileKey) {
+  const definition = getFileDefinition(fileKey);
+  if (definition) {
+    return `<${formatVisibleFileName(definition.defaultName)}>`;
   }
 
-  return stripKnownExtension(normalizedFileName, definition);
+  const ruleFile = getRuleFileByKey(fileKey);
+  return ruleFile ? `<${getRuleFileTypeLabel(ruleFile.path)}>` : "";
 }
 
 function renderFileTabState() {
-  const nextNameableFile = pickNextNameableFile();
+  getFileTabButtons().forEach((button) => {
+    const isActive = button.getAttribute("data-file-target") === state.activeFile;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-selected", String(isActive));
+  });
 
-  elements.fileTabShells.forEach((shell) => {
+  getFilePanels().forEach((panel) => {
+    const isActive = panel.getAttribute("data-file-panel") === state.activeFile;
+    panel.classList.toggle("is-active", isActive);
+  });
+
+  getFileTabShells().forEach((shell) => {
     const fileKey = shell.getAttribute("data-file-shell");
     const isActive = fileKey === state.activeFile;
     const isEditing = fileKey === state.fileNamingSession?.fileKey;
@@ -1715,27 +2083,136 @@ function renderFileTabState() {
     shell.classList.toggle("is-active", isActive);
     shell.classList.toggle("is-editing", isEditing);
     shell.classList.toggle("is-named", isNamed);
+
+    const renameInput = fileKey ? getFileRenameInput(fileKey) : null;
+    if (renameInput) {
+      renameInput.classList.toggle("is-hidden", !isEditing);
+    }
+
+    if (fileKey && isEditing) {
+      syncFileRenameWidth(fileKey);
+    } else {
+      shell.style.removeProperty("width");
+    }
   });
 
   if (elements.fileCreateButton) {
-    const canCreateName = Boolean(nextNameableFile);
-    elements.fileCreateButton.disabled = state.isBusy || !canCreateName;
-    elements.fileCreateButton.title = canCreateName
-      ? "Name another starter file"
-      : "All starter files already have names";
+    elements.fileCreateButton.disabled = state.isBusy;
+    elements.fileCreateButton.title = "Add another generated file";
     elements.fileCreateButton.setAttribute(
       "aria-label",
-      canCreateName
-        ? "Name another starter file"
-        : "All starter files already have names",
+      "Add another generated file",
     );
   }
+}
+
+function getFileRenameInput(fileKey) {
+  return (
+    elements.fileRenameInputs[fileKey] ??
+    queryByDataValue(elements.fileTabStrip, "data-file-rename-input", fileKey)
+  );
+}
+
+function getFileTabShell(fileKey) {
+  return (
+    getFileTabShells().find((shell) => shell.getAttribute("data-file-shell") === fileKey) ??
+    null
+  );
+}
+
+function getFileTabButton(fileKey) {
+  return (
+    getFileTabButtons().find((button) => button.getAttribute("data-file-target") === fileKey) ??
+    null
+  );
+}
+
+function getFileTabLabel(fileKey) {
+  return (
+    elements.fileTabLabels[fileKey] ??
+    queryByDataValue(elements.fileTabStrip, "data-file-tab-label", fileKey)
+  );
+}
+
+function getFilePanelLabel(fileKey) {
+  return (
+    elements.filePanelLabels[fileKey] ??
+    queryByDataValue(elements.editorStack, "data-file-panel-label", fileKey)
+  );
+}
+
+function getFilePanels() {
+  return Array.from(elements.editorStack?.querySelectorAll("[data-file-panel]") ?? []);
+}
+
+function getFileTabButtons() {
+  return Array.from(elements.fileTabStrip?.querySelectorAll("[data-file-target]") ?? []);
+}
+
+function getFileTabShells() {
+  return Array.from(elements.fileTabStrip?.querySelectorAll("[data-file-shell]") ?? []);
+}
+
+function getFileRenameInputs() {
+  return Array.from(elements.fileTabStrip?.querySelectorAll("[data-file-rename-input]") ?? []);
+}
+
+function getRuleFileEditors() {
+  return Array.from(elements.editorStack?.querySelectorAll("[data-rule-file-editor]") ?? []);
+}
+
+function syncFileRenameWidth(fileKey) {
+  const shell = getFileTabShell(fileKey);
+  const renameInput = getFileRenameInput(fileKey);
+  if (!shell || !renameInput) {
+    return;
+  }
+
+  const minimumWidth =
+    state.fileNamingSession?.fileKey === fileKey ? state.fileNamingSession.minimumWidth ?? 0 : 0;
+  const renameWidth = measureFileRenameWidth(renameInput);
+  shell.style.width = `${Math.max(minimumWidth, renameWidth)}px`;
+}
+
+function measureFileRenameWidth(renameInput) {
+  const computedStyle = window.getComputedStyle(renameInput);
+  const font = computedStyle.font || [
+    computedStyle.fontStyle,
+    computedStyle.fontVariant,
+    computedStyle.fontWeight,
+    computedStyle.fontStretch,
+    computedStyle.fontSize,
+    computedStyle.fontFamily,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const measureContext = FILE_RENAME_MEASURE_CANVAS.getContext("2d");
+  const text = renameInput.value || renameInput.placeholder || "";
+  const horizontalPadding =
+    (Number.parseFloat(computedStyle.paddingLeft) || 0) +
+    (Number.parseFloat(computedStyle.paddingRight) || 0) +
+    (Number.parseFloat(computedStyle.borderLeftWidth) || 0) +
+    (Number.parseFloat(computedStyle.borderRightWidth) || 0);
+  const letterSpacing = Number.parseFloat(computedStyle.letterSpacing) || 0;
+
+  if (!measureContext) {
+    return Math.ceil(renameInput.scrollWidth + 8);
+  }
+
+  measureContext.font = font;
+
+  const measuredTextWidth =
+    measureContext.measureText(text).width +
+    Math.max(0, text.length - 1) * letterSpacing;
+
+  return Math.ceil(measuredTextWidth + horizontalPadding + 8);
 }
 
 function isDefaultFileName(fileKey) {
   const definition = getFileDefinition(fileKey);
   if (!definition) {
-    return true;
+    const ruleFile = getRuleFileByKey(fileKey);
+    return !ruleFile || normalizeCustomFilePath(ruleFile.path) === CUSTOM_RULE_FILE_DEFAULT_PATH;
   }
 
   return (
@@ -1746,11 +2223,12 @@ function isDefaultFileName(fileKey) {
 
 function getEditableFileName(fileKey) {
   const definition = getFileDefinition(fileKey);
-  if (!definition || isDefaultFileName(fileKey)) {
-    return "";
+  if (definition) {
+    return stripKnownExtension(state.fileNames[fileKey] ?? definition.defaultName, definition);
   }
 
-  return stripKnownExtension(state.fileNames[fileKey], definition);
+  const ruleFile = getRuleFileByKey(fileKey);
+  return ruleFile ? normalizeCustomFilePath(ruleFile.path) : "";
 }
 
 function stripKnownExtension(value, definition) {
@@ -1764,14 +2242,35 @@ function stripKnownExtension(value, definition) {
   return trimmed;
 }
 
+function formatVisibleFileName(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.toLowerCase().startsWith("index.")) {
+    return trimmed.slice("index.".length);
+  }
+
+  return trimmed;
+}
+
+function abbreviateTabLabel(value, maxLength = 9) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed || trimmed.length <= maxLength) {
+    return trimmed;
+  }
+
+  return `${trimmed.slice(0, Math.max(1, maxLength - 2))}..`;
+}
+
 function normalizeSingleFileName(value, definition) {
   const trimmed = String(value ?? "").trim();
-
   if (!trimmed) {
     return definition.defaultName;
   }
 
-  if (trimmed.includes(".")) {
+  if (trimmed.toLowerCase().endsWith(definition.extension.toLowerCase())) {
     return trimmed;
   }
 
@@ -1783,6 +2282,258 @@ function normalizeFileNames(fileNames) {
     result[file.key] = normalizeSingleFileName(fileNames?.[file.key], file);
     return result;
   }, {});
+}
+
+function createStateRuleFiles(value) {
+  return normalizeRuleFiles(value).map((file) => ({
+    content: file.content,
+    id: createRuleFileId(),
+    mimeType: file.mimeType || inferRuleFileMimeType(file.path),
+    path: file.path,
+  }));
+}
+
+function serializeRuleFiles(ruleFiles) {
+  return ruleFiles.map((file) => ({
+    content: typeof file?.content === "string" ? file.content : "",
+    mimeType: typeof file?.mimeType === "string" ? file.mimeType : "",
+    path: normalizeCustomFilePath(file?.path),
+  }));
+}
+
+function createRuleFileId() {
+  nextRuleFileId += 1;
+  return `rule-file-${nextRuleFileId}`;
+}
+
+function createRuleFile() {
+  if (state.fileNamingSession) {
+    closeFileNamingSession();
+  }
+
+  const ruleFile = {
+    content: "",
+    id: createRuleFileId(),
+    mimeType: inferRuleFileMimeType(CUSTOM_RULE_FILE_DEFAULT_PATH),
+    path: CUSTOM_RULE_FILE_DEFAULT_PATH,
+  };
+
+  state.ruleFiles.push(ruleFile);
+  updateFileLabels();
+  openFileNamingSession(getRuleFileKey(ruleFile.id), "create", {
+    returnFileKey: state.activeFile,
+  });
+  syncWorkspaceState();
+}
+
+function getRuleFileKey(ruleFileId) {
+  return `file:${ruleFileId}`;
+}
+
+function isCustomFileKey(fileKey) {
+  return typeof fileKey === "string" && fileKey.startsWith("file:");
+}
+
+function getRuleFileIdFromKey(fileKey) {
+  return isCustomFileKey(fileKey) ? fileKey.slice("file:".length) : "";
+}
+
+function getRuleFileByKey(fileKey) {
+  return state.ruleFiles.find((file) => file.id === getRuleFileIdFromKey(fileKey)) ?? null;
+}
+
+function removeRuleFileByKey(fileKey) {
+  const ruleFileId = getRuleFileIdFromKey(fileKey);
+  if (!ruleFileId) {
+    return;
+  }
+
+  state.ruleFiles = state.ruleFiles.filter((file) => file.id !== ruleFileId);
+  updateFileLabels();
+}
+
+function deleteCustomRuleFile(session) {
+  const fileKey = session?.fileKey;
+  if (!fileKey || !isCustomFileKey(fileKey)) {
+    return;
+  }
+
+  setError("");
+  removeRuleFileByKey(fileKey);
+  state.fileNamingSession = null;
+
+  const nextFileKey = getReplacementFileKey(fileKey, session.returnFileKey);
+  switchActiveFile(nextFileKey, { preserveComposer: true });
+  renderFileTabState();
+  syncWorkspaceState();
+}
+
+function isKnownFileKey(fileKey) {
+  return Boolean(getFileDefinition(fileKey) || getRuleFileByKey(fileKey));
+}
+
+function ensureActiveFileIsValid() {
+  if (!isKnownFileKey(state.activeFile)) {
+    state.activeFile = "html";
+  }
+}
+
+function getReplacementFileKey(removedFileKey, preferredFileKey) {
+  if (
+    preferredFileKey &&
+    preferredFileKey !== removedFileKey &&
+    isKnownFileKey(preferredFileKey)
+  ) {
+    return preferredFileKey;
+  }
+
+  const nextCustomFile = state.ruleFiles.find(
+    (file) => getRuleFileKey(file.id) !== removedFileKey,
+  );
+  if (nextCustomFile) {
+    return getRuleFileKey(nextCustomFile.id);
+  }
+
+  return "html";
+}
+
+function getFileRenamePlaceholder(fileKey) {
+  const definition = getFileDefinition(fileKey);
+  if (definition) {
+    return definition.placeholder;
+  }
+
+  return CUSTOM_RULE_FILE_DEFAULT_PATH;
+}
+
+function normalizeCustomFilePath(value) {
+  const normalized = normalizeRuleFilePath(value);
+  if (!normalized) {
+    return CUSTOM_RULE_FILE_DEFAULT_PATH;
+  }
+
+  const segments = normalized.split("/");
+  const lastSegment = segments[segments.length - 1] ?? "";
+  if (!lastSegment || lastSegment.endsWith(".")) {
+    return `${normalized.replace(/\.+$/, "")}.txt`;
+  }
+
+  if (!lastSegment.includes(".")) {
+    return `${normalized}.txt`;
+  }
+
+  return normalized;
+}
+
+function inferRuleFileMimeType(filePath) {
+  const extension = getRuleFileTypeLabel(filePath);
+
+  if (extension === "svg") return "image/svg+xml";
+  if (extension === "html") return "text/html";
+  if (extension === "css") return "text/css";
+  if (extension === "js") return "text/javascript";
+  if (extension === "json") return "application/json";
+  if (extension === "txt") return "text/plain";
+
+  return "text/plain";
+}
+
+function getRuleFileTypeLabel(filePath) {
+  const normalized = normalizeCustomFilePath(filePath);
+  const lastSegment = normalized.split("/").pop() ?? normalized;
+  const lastDotIndex = lastSegment.lastIndexOf(".");
+
+  if (lastDotIndex < 0 || lastDotIndex === lastSegment.length - 1) {
+    return "txt";
+  }
+
+  return lastSegment.slice(lastDotIndex + 1).toLowerCase();
+}
+
+function renderRuleFiles() {
+  const tabStrip = elements.fileTabStrip;
+  const editorStack = elements.editorStack;
+  const createShell = elements.fileCreateButton?.closest(".file-tab-shell");
+  if (!tabStrip || !editorStack || !createShell) {
+    return;
+  }
+
+  tabStrip.querySelectorAll("[data-custom-file-shell]").forEach((node) => node.remove());
+  editorStack.querySelectorAll("[data-custom-file-panel]").forEach((node) => node.remove());
+
+  state.ruleFiles.forEach((file) => {
+    const fileKey = getRuleFileKey(file.id);
+    const shell = document.createElement("div");
+    shell.className = "file-tab-shell";
+    shell.dataset.customFileShell = "true";
+    shell.dataset.fileShell = fileKey;
+
+    const button = document.createElement("button");
+    button.className = "file-tab";
+    button.type = "button";
+    button.dataset.fileTarget = fileKey;
+    button.setAttribute("role", "tab");
+    button.setAttribute("aria-selected", "false");
+    button.disabled = state.isBusy;
+
+    const topline = document.createElement("span");
+    topline.className = "file-tab-topline";
+
+    const dot = document.createElement("span");
+    dot.className = "file-tab-dot file-tab-dot-file";
+    topline.appendChild(dot);
+
+    const title = document.createElement("span");
+    title.className = "file-tab-title";
+    title.dataset.fileTabLabel = fileKey;
+    title.textContent = getTabDisplayFileName(fileKey);
+    topline.appendChild(title);
+
+    button.appendChild(topline);
+    shell.appendChild(button);
+
+    const renameInput = document.createElement("textarea");
+    renameInput.className = "file-tab-rename-input is-hidden";
+    renameInput.dataset.fileRenameInput = fileKey;
+    renameInput.rows = 1;
+    renameInput.wrap = "off";
+    renameInput.autocomplete = "off";
+    renameInput.spellcheck = false;
+    renameInput.placeholder = CUSTOM_RULE_FILE_DEFAULT_PATH;
+    renameInput.setAttribute("aria-label", "Rename generated file");
+    renameInput.disabled = state.isBusy;
+    shell.appendChild(renameInput);
+
+    tabStrip.insertBefore(shell, createShell);
+
+    const panel = document.createElement("label");
+    panel.className = "field editor-panel";
+    panel.dataset.customFilePanel = "true";
+    panel.dataset.filePanel = fileKey;
+
+    const marker = document.createElement("span");
+    marker.className = "editor-panel-marker";
+    marker.dataset.filePanelLabel = fileKey;
+    marker.textContent = getEditorFileMarker(fileKey);
+    panel.appendChild(marker);
+
+    const editor = document.createElement("textarea");
+    editor.rows = 16;
+    editor.dataset.ruleFileEditor = fileKey;
+    editor.value = file.content;
+    editor.disabled = state.isBusy;
+    panel.appendChild(editor);
+
+    editorStack.appendChild(panel);
+  });
+}
+
+function queryByDataValue(root, attributeName, value) {
+  if (!root || typeof value !== "string" || typeof CSS?.escape !== "function") {
+    return null;
+  }
+
+  return root.querySelector(`[${attributeName}="${CSS.escape(value)}"]`);
 }
 
 function normalizeRuleFiles(value) {
@@ -1879,21 +2630,32 @@ function normalizeFileLayout(payload) {
 }
 
 function renderScaffoldSuggestion() {
-  if (elements.newScaffoldInput) {
-    elements.newScaffoldInput.placeholder = "Name a new vibe pack";
-  }
-
   if (elements.starterSuggestionButton) {
-    elements.starterSuggestionButton.textContent = RED_TEXT_STARTER_LABEL;
-    elements.starterSuggestionButton.classList.remove("is-hidden");
     elements.starterSuggestionButton.disabled = false;
     elements.starterSuggestionButton.title =
-      "Load a CSS starter that forces all text red with !important";
+      "Save a CSS starter that forces all text red with !important";
     elements.starterSuggestionButton.setAttribute(
       "aria-label",
-      "Load a CSS starter that forces all text red with !important",
+      "Save a CSS starter that forces all text red with !important",
     );
   }
+
+  if (elements.loadExampleButton) {
+    elements.loadExampleButton.title =
+      "Save the Hello World starter as a finished rule";
+    elements.loadExampleButton.setAttribute(
+      "aria-label",
+      "Save the Hello World starter as a finished rule",
+    );
+  }
+}
+
+function getStarterRule(starterKey) {
+  return STARTER_RULES.find((starter) => starter.key === starterKey) ?? null;
+}
+
+function normalizeStarterName(value) {
+  return String(value ?? "").trim().toLowerCase();
 }
 
 function escapeHtml(value) {
