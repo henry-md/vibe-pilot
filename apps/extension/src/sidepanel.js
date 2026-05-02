@@ -53,6 +53,8 @@ const CHAT_IMAGE_MAX_EDGE = 1400;
 const CHAT_IMAGE_PREVIEW_QUALITY = 0.82;
 const CHAT_IMAGE_INLINE_MAX_LENGTH = 2_000_000;
 const IMAGE_FILE_NAME_PATTERN = /\.(apng|avif|gif|heic|heif|jpe?g|png|svg|webp)$/i;
+const EXTENSION_MESSAGE_TIMEOUT_MS = 30000;
+const ASSISTANT_EXTENSION_MESSAGE_TIMEOUT_MS = 10 * 60 * 1000;
 let nextRuleFileId = 0;
 let nextChatImageId = 0;
 
@@ -66,6 +68,7 @@ const state = {
   assistantTurnStartMessageId: null,
   activeTab: null,
   activeView: "create",
+  chatExpanded: false,
   confirmModalResolver: null,
   currentRuleId: null,
   editingRuleSnapshot: null,
@@ -101,6 +104,7 @@ const elements = {
   chatImageInput: document.querySelector("#chat-image-input"),
   chatInput: document.querySelector("#chat-input"),
   chatAttachments: document.querySelector("#chat-attachments"),
+  chatExpandButton: document.querySelector("#chat-expand-button"),
   chatMessages: document.querySelector("#chat-messages"),
   chatSendButton: document.querySelector("#chat-send-button"),
   chatUploadButton: document.querySelector("#chat-upload-button"),
@@ -129,7 +133,6 @@ const elements = {
   htmlSnippet: document.querySelector("#html-snippet"),
   editorStack: document.querySelector(".editor-stack"),
   javascriptSnippet: document.querySelector("#javascript-snippet"),
-  leaveEditButton: document.querySelector("#leave-edit-button"),
   loadExampleButton: document.querySelector("#load-example-button"),
   matchPattern: document.querySelector("#match-pattern"),
   newScaffoldInput: document.querySelector("#new-scaffold-name"),
@@ -347,6 +350,14 @@ function wireEvents() {
     void sendAssistantMessage();
   });
 
+  elements.chatExpandButton?.addEventListener("click", () => {
+    if (!state.chatExpanded && state.activeCreateMode !== "chat") {
+      switchCreateMode("chat");
+    }
+
+    setChatExpanded(!state.chatExpanded);
+  });
+
   elements.chatUploadButton?.addEventListener("click", () => {
     elements.chatImageInput?.click();
   });
@@ -492,16 +503,6 @@ function wireEvents() {
     ),
   );
 
-  elements.leaveEditButton?.addEventListener("click", () =>
-    runAction(
-      async () => {
-        await leaveSavedRule();
-      },
-      "Leaving this saved rule...",
-      "Blank rule ready.",
-    ),
-  );
-
   elements.applyDraftButton?.addEventListener("click", () =>
     runAction(
       async () => {
@@ -533,17 +534,47 @@ function wireEvents() {
       if (ruleId) {
         const selectedRule = state.rules.find((item) => item.id === ruleId);
         const ruleName = selectedRule?.name ?? "rule";
+        const shouldApply = selectedRule?.enabled !== false;
 
         void runAction(
           async () => {
             await openRuleEditor(ruleId, {
-              applyOnOpen: true,
+              applyOnOpen: shouldApply,
             });
           },
-          `Opening and applying "${ruleName}"...`,
-          `"${ruleName}" applied.`,
+          shouldApply
+            ? `Opening and applying "${ruleName}"...`
+            : `Opening "${ruleName}"...`,
+          shouldApply ? `"${ruleName}" applied.` : `Editing "${ruleName}".`,
         );
       }
+    }
+  });
+
+  elements.rulesList?.addEventListener("change", (event) => {
+    const toggle =
+      event.target instanceof HTMLInputElement &&
+      event.target.matches("[data-rule-toggle-id]")
+        ? event.target
+        : null;
+
+    if (!toggle) {
+      return;
+    }
+
+    const ruleId = toggle.getAttribute("data-rule-toggle-id");
+    if (ruleId) {
+      void toggleRuleEnabled(ruleId, toggle.checked);
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (
+      event.key === "Escape" &&
+      state.chatExpanded &&
+      !document.querySelector("dialog[open]")
+    ) {
+      setChatExpanded(false);
     }
   });
 }
@@ -581,10 +612,12 @@ async function runAction(action, pendingMessage, doneMessage) {
   try {
     await action();
     setStatus(doneMessage);
+    return true;
   } catch (error) {
     setError(
       error instanceof Error ? error.message : "Unexpected extension error.",
     );
+    return false;
   } finally {
     toggleBusy(false);
   }
@@ -642,14 +675,20 @@ async function sendAssistantMessage() {
     await runAction(
       async () => {
         await sendMessage("VIBE_PILOT_SAVE_DRAFT", readWorkspaceRule());
-        const response = await sendMessage("VIBE_PILOT_RUN_ASSISTANT", {
-          attachments: attachments.map((image) => ({
-            detail: image.detail,
-            image_url: image.url,
-          })),
-          prompt,
-          previousResponseId: state.assistantPreviousResponseId,
-        });
+        const response = await sendMessage(
+          "VIBE_PILOT_RUN_ASSISTANT",
+          {
+            attachments: attachments.map((image) => ({
+              detail: image.detail,
+              image_url: image.url,
+            })),
+            prompt,
+            previousResponseId: state.assistantPreviousResponseId,
+          },
+          {
+            timeoutMs: ASSISTANT_EXTENSION_MESSAGE_TIMEOUT_MS,
+          },
+        );
 
         state.assistantPreviousResponseId =
           typeof response?.previousResponseId === "string" &&
@@ -776,10 +815,25 @@ async function applyCurrentRule(options = {}) {
   }
 }
 
-async function sendMessage(type, payload) {
-  const response = await chrome.runtime.sendMessage({
-    type,
-    payload,
+async function sendMessage(type, payload, options = {}) {
+  const timeoutMs =
+    typeof options.timeoutMs === "number" && Number.isFinite(options.timeoutMs)
+      ? options.timeoutMs
+      : EXTENSION_MESSAGE_TIMEOUT_MS;
+  let timeoutId;
+
+  const response = await Promise.race([
+    chrome.runtime.sendMessage({
+      type,
+      payload,
+    }),
+    new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error("The extension runtime did not respond in time."));
+      }, timeoutMs);
+    }),
+  ]).finally(() => {
+    clearTimeout(timeoutId);
   });
 
   if (!response?.ok) {
@@ -870,6 +924,7 @@ function readWorkspaceRule() {
   return {
     id: state.currentRuleId,
     name: elements.ruleName?.value.trim() ?? "",
+    enabled: getCurrentRuleEnabled(),
     matchPattern:
       elements.matchPattern?.value.trim() || DEFAULT_DRAFT.matchPattern,
     html: elements.htmlSnippet?.value ?? "",
@@ -980,6 +1035,10 @@ function switchCreateMode(nextMode) {
     closeFileNamingSession();
   }
 
+  if (nextMode !== "chat" && state.chatExpanded) {
+    setChatExpanded(false);
+  }
+
   elements.createModeTabs.forEach((button) => {
     const isActive = button.getAttribute("data-create-mode-target") === nextMode;
     button.classList.toggle("is-active", isActive);
@@ -991,6 +1050,8 @@ function switchCreateMode(nextMode) {
     panel.classList.toggle("is-active", isActive);
     panel.classList.toggle("is-hidden", !isActive);
   });
+
+  syncChatExpandButtonVisibility();
 }
 
 function switchActiveFile(nextFile, options = {}) {
@@ -1209,41 +1270,101 @@ function renderRulesList(rules) {
   elements.rulesList.innerHTML = rules
     .map((rule) => {
       const target = rule.matchPattern;
+      const isEnabled = rule.enabled !== false;
+      const openLabel = isEnabled ? "Open and apply" : "Open";
+      const toggleLabel = isEnabled ? "Turn off" : "Turn on";
 
       return `
-        <article class="rule-card-shell">
+        <article class="rule-card-shell${isEnabled ? "" : " is-rule-disabled"}">
           <button
             class="rule-card"
             type="button"
             data-edit-rule-id="${escapeHtml(rule.id)}"
-            aria-label="Open and apply ${escapeHtml(rule.name)}"
-            title="Open and apply ${escapeHtml(rule.name)}"
+            aria-label="${openLabel} ${escapeHtml(rule.name)}"
+            title="${openLabel} ${escapeHtml(rule.name)}"
           >
             <strong class="rule-card-name">${escapeHtml(rule.name)}</strong>
             <p class="rule-card-meta">${escapeHtml(target)}</p>
           </button>
-          <button
-            class="icon-button icon-button-danger rule-delete-button"
-            type="button"
-            data-delete-rule-id="${escapeHtml(rule.id)}"
-            aria-label="Delete ${escapeHtml(rule.name)}"
-            title="Delete ${escapeHtml(rule.name)}"
-          >
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                d="M6 2.75h4m-6 2h8m-6.5 1.5v4.5m3-4.5v4.5M5.25 4.75l.4 6.3a1 1 0 0 0 1 .95h2.7a1 1 0 0 0 1-.95l.4-6.3"
-                fill="none"
-                stroke="currentColor"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="1.4"
+          <div class="rule-card-actions">
+            <label
+              class="rule-toggle"
+              aria-label="${toggleLabel} ${escapeHtml(rule.name)}"
+              title="${toggleLabel} ${escapeHtml(rule.name)}"
+            >
+              <input
+                class="rule-toggle-input"
+                type="checkbox"
+                data-rule-toggle-id="${escapeHtml(rule.id)}"
+                aria-label="${toggleLabel} ${escapeHtml(rule.name)}"
+                ${isEnabled ? "checked" : ""}
               />
-            </svg>
-          </button>
+              <span class="rule-toggle-track" aria-hidden="true">
+                <span class="rule-toggle-thumb"></span>
+              </span>
+            </label>
+            <button
+              class="icon-button icon-button-danger rule-delete-button"
+              type="button"
+              data-delete-rule-id="${escapeHtml(rule.id)}"
+              aria-label="Delete ${escapeHtml(rule.name)}"
+              title="Delete ${escapeHtml(rule.name)}"
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M6 2.75h4m-6 2h8m-6.5 1.5v4.5m3-4.5v4.5M5.25 4.75l.4 6.3a1 1 0 0 0 1 .95h2.7a1 1 0 0 0 1-.95l.4-6.3"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  stroke-width="1.4"
+                />
+              </svg>
+            </button>
+          </div>
         </article>
       `;
     })
     .join("");
+}
+
+async function toggleRuleEnabled(ruleId, enabled) {
+  const rule = state.rules.find((item) => item.id === ruleId);
+  const ruleName = rule?.name ?? "this rule";
+  const nextStateLabel = enabled ? "on" : "off";
+
+  const succeeded = await runAction(
+    async () => {
+      const response = await sendMessage("VIBE_PILOT_SET_RULE_ENABLED", {
+        enabled,
+        ruleId,
+      });
+      const updatedRule = response?.rule
+        ? createRuleSnapshot(response.rule)
+        : createRuleSnapshot({
+            ...rule,
+            enabled,
+          });
+
+      upsertRule(updatedRule);
+
+      if (state.editingRuleSnapshot?.rule?.id === ruleId) {
+        state.editingRuleSnapshot = {
+          ...state.editingRuleSnapshot,
+          rule: {
+            ...state.editingRuleSnapshot.rule,
+            enabled: updatedRule.enabled,
+          },
+        };
+      }
+    },
+    `Turning "${ruleName}" ${nextStateLabel}...`,
+    `"${ruleName}" turned ${nextStateLabel}.`,
+  );
+
+  if (!succeeded) {
+    renderRulesList(state.rules);
+  }
 }
 
 async function openRuleEditor(ruleId, options = {}) {
@@ -1337,6 +1458,35 @@ function setError(message) {
   elements.errorBanner.classList.remove("is-hidden");
 }
 
+function setChatExpanded(isExpanded) {
+  if (isExpanded && state.activeCreateMode !== "chat") {
+    switchCreateMode("chat");
+  }
+
+  state.chatExpanded = Boolean(isExpanded);
+  document.body.classList.toggle("chat-expanded", state.chatExpanded);
+  elements.chatPanel?.classList.toggle("is-expanded", state.chatExpanded);
+
+  if (elements.chatExpandButton) {
+    const label = state.chatExpanded ? "Collapse chat" : "Expand chat";
+    elements.chatExpandButton.setAttribute("aria-label", label);
+    elements.chatExpandButton.setAttribute(
+      "aria-pressed",
+      String(state.chatExpanded),
+    );
+    elements.chatExpandButton.title = label;
+  }
+
+  autoResizeChat();
+}
+
+function syncChatExpandButtonVisibility() {
+  elements.chatExpandButton?.classList.toggle(
+    "is-hidden",
+    state.activeCreateMode !== "chat",
+  );
+}
+
 function toggleBusy(isBusy) {
   state.isBusy = isBusy;
   document.body.classList.toggle("is-busy", isBusy);
@@ -1348,12 +1498,12 @@ function toggleBusy(isBusy) {
     elements.chatSendButton,
     elements.chatUploadButton,
     elements.fileCreateButton,
-    elements.leaveEditButton,
     elements.loadExampleButton,
     elements.scaffoldRuleButton,
     elements.starterSuggestionButton,
     ...elements.createModeTabs,
     ...getFileTabButtons(),
+    ...getRuleListControls(),
     ...elements.viewTabs,
   ];
 
@@ -1400,10 +1550,6 @@ function syncWorkspaceState() {
     elements.ruleModeLabel.textContent = isEditingSavedRule()
       ? "Editing saved rule"
       : "New rule";
-  }
-
-  if (elements.leaveEditButton) {
-    elements.leaveEditButton.classList.toggle("is-hidden", !isEditingSavedRule());
   }
 
   if (elements.chatSendButton) {
@@ -1988,21 +2134,24 @@ function renderTranscriptBlock(block) {
 }
 
 function renderAssistantTurn(message, toolMessages) {
-  const verificationImages = collectVerificationImages(toolMessages);
-  const latestImage =
-    verificationImages.length > 0
-      ? verificationImages[verificationImages.length - 1]
-      : null;
-  const assistantMessage = promoteVerificationImage(message, latestImage);
-  const hiddenImageUrls = latestImage ? new Set([latestImage.url]) : null;
+  const verificationMessages = collectVerificationMessages(toolMessages);
+  const hiddenVerificationIds = new Set(
+    verificationMessages.map((toolMessage) => toolMessage.id),
+  );
+  const collapsedToolMessages = toolMessages.filter(
+    (toolMessage) => !hiddenVerificationIds.has(toolMessage.id),
+  );
+  const verificationMarkup = renderVerificationMessages(verificationMessages);
+  const toolMarkup =
+    collapsedToolMessages.length > 0
+      ? renderToolGroup(collapsedToolMessages, {
+          nested: true,
+        })
+      : "";
 
   return `
-    ${renderChatMessage(assistantMessage, {
-        compactImages: Boolean(latestImage),
-        toolMarkup: renderToolGroup(toolMessages, {
-          hiddenImageUrls,
-          nested: true,
-        }),
+    ${renderChatMessage(message, {
+        toolMarkup: `${verificationMarkup}${toolMarkup}`,
       })}
   `;
 }
@@ -2049,7 +2198,13 @@ function renderChatMessage(message, options = {}) {
 }
 
 function renderLiveToolMessage(message) {
-  return renderChatMessage(message);
+  return `
+    <section class="chat-row chat-row-assistant chat-row-tool">
+      ${renderToolCall(message, null, {
+        standalone: true,
+      })}
+    </section>
+  `;
 }
 
 function renderToolGroup(messages, options = {}) {
@@ -2129,12 +2284,19 @@ function renderToolCall(message, index, options = {}) {
     : [];
   const imagesMarkup = imagesToRender.length > 0 ? renderImageCards(imagesToRender) : "";
   const metaPills = renderToolMetaPills(message);
+  const showIndex = Number.isInteger(index) && index >= 0;
 
   return `
-    <article class="chat-toolcall${message.status === "error" ? " is-error" : ""}">
+    <article class="chat-toolcall${message.status === "error" ? " is-error" : ""}${
+      options.standalone ? " chat-toolcall-standalone" : ""
+    }">
       <div class="chat-toolcall-header">
         <div class="chat-toolcall-title-row">
-          <span class="chat-toolcall-index">${index + 1}</span>
+          ${
+            showIndex
+              ? `<span class="chat-toolcall-index">${index + 1}</span>`
+              : ""
+          }
           <strong class="chat-toolcall-name">${escapeHtml(toolLabel)}</strong>
         </div>
         ${metaPills.join("")}
@@ -2143,6 +2305,37 @@ function renderToolCall(message, index, options = {}) {
       ${message.text ? `<p class="chat-toolcall-text">${formatMultilineText(message.text)}</p>` : ""}
       ${argumentsMarkup}
     </article>
+  `;
+}
+
+function renderVerificationMessages(messages) {
+  const verificationMessages = Array.isArray(messages) ? messages : [];
+
+  if (!verificationMessages.length) {
+    return "";
+  }
+
+  return `
+    <div class="chat-verification-list">
+      ${verificationMessages.map((message) => renderVerificationMessage(message)).join("")}
+    </div>
+  `;
+}
+
+function renderVerificationMessage(message) {
+  const images = Array.isArray(message.images) ? message.images : [];
+  const imagesMarkup = images.length > 0 ? renderImageCards(images) : "";
+  const metaPills = renderToolMetaPills(message);
+
+  return `
+    <section class="chat-verification${message.status === "error" ? " is-error" : ""}">
+      <div class="chat-toolcall-header">
+        <strong class="chat-toolcall-name">Screenshot</strong>
+        ${metaPills.join("")}
+      </div>
+      ${message.text ? `<p class="chat-toolcall-text">${formatMultilineText(message.text)}</p>` : ""}
+      ${imagesMarkup ? `<div class="chat-image-grid">${imagesMarkup}</div>` : ""}
+    </section>
   `;
 }
 
@@ -2191,34 +2384,18 @@ function collectToolImages(messages) {
   );
 }
 
-function collectVerificationImages(messages) {
+function collectVerificationMessages(messages) {
   if (!Array.isArray(messages) || !messages.length) {
     return [];
   }
 
-  return messages.flatMap((message) => {
-    if (message?.toolName !== "take_screenshot" || message?.status === "running") {
-      return [];
-    }
-
-    return Array.isArray(message.images)
-      ? message.images.filter((image) => typeof image?.url === "string" && image.url.trim())
-      : [];
-  });
-}
-
-function promoteVerificationImage(message, latestImage) {
-  if (!latestImage) {
-    return message;
-  }
-
-  const existingImages = Array.isArray(message?.images) ? message.images : [];
-  const hasImageAlready = existingImages.some((image) => image?.url === latestImage.url);
-
-  return {
-    ...message,
-    images: hasImageAlready ? existingImages : [...existingImages, latestImage],
-  };
+  return messages.filter(
+    (message) =>
+      message?.toolName === "take_screenshot" &&
+      message?.status !== "running" &&
+      Array.isArray(message.images) &&
+      message.images.some((image) => typeof image?.url === "string" && image.url.trim()),
+  );
 }
 
 function buildCompletedAssistantMessage(assistantMessages, toolMessages) {
@@ -2243,12 +2420,12 @@ function buildCompletedAssistantMessage(assistantMessages, toolMessages) {
     return null;
   }
 
-  const verificationImages = collectVerificationImages(toolMessages);
+  const verificationMessages = collectVerificationMessages(toolMessages);
   const hasErrors = toolMessages.some((message) => message.status === "error");
 
   return createAssistantMessage(
     "assistant",
-    verificationImages.length > 0
+    verificationMessages.length > 0
       ? "Completed the request and attached the verification screenshot."
       : "Completed the request. See the toolcalls below for details.",
     {
@@ -2557,6 +2734,7 @@ function createRuleSnapshot(rule) {
   return {
     id: typeof rule?.id === "string" && rule.id.trim() ? rule.id.trim() : null,
     name: typeof rule?.name === "string" ? rule.name.trim() : "",
+    enabled: rule?.enabled !== false,
     matchPattern:
       typeof rule?.matchPattern === "string" && rule.matchPattern.trim()
         ? rule.matchPattern.trim()
@@ -2570,6 +2748,19 @@ function createRuleSnapshot(rule) {
       rule?.chatPreviousResponseId,
     ),
   };
+}
+
+function getCurrentRuleEnabled() {
+  if (!state.currentRuleId) {
+    return true;
+  }
+
+  const listedRule = state.rules.find((rule) => rule.id === state.currentRuleId);
+  if (listedRule) {
+    return listedRule.enabled !== false;
+  }
+
+  return state.editingRuleSnapshot?.rule?.enabled !== false;
 }
 
 async function persistCurrentRuleConversation() {
@@ -2798,6 +2989,12 @@ function getFilePanels() {
 
 function getFileTabButtons() {
   return Array.from(elements.fileTabStrip?.querySelectorAll("[data-file-target]") ?? []);
+}
+
+function getRuleListControls() {
+  return Array.from(
+    elements.rulesList?.querySelectorAll("button, input") ?? [],
+  );
 }
 
 function getFileTabShells() {
