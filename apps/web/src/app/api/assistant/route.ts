@@ -22,6 +22,7 @@ const CORS_HEADERS = {
 const DEFAULT_MODEL = "gpt-5";
 const ASSISTANT_DEBUG_ENABLED =
   process.env.VIBE_PILOT_ASSISTANT_DEBUG?.trim() === "1";
+type AssistantResponseStream = ReturnType<OpenAI["responses"]["stream"]>;
 
 function getAssistantApiKey() {
   return process.env.OPENAI_API_KEY?.trim() ?? "";
@@ -103,6 +104,67 @@ function buildAssistantCreateParams(
     max_output_tokens: 2500,
     tools: [...VIBE_PILOT_RESPONSE_TOOLS],
   };
+}
+
+function getAssistantErrorStatus(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return null;
+  }
+
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" ? status : null;
+}
+
+function isMissingPreviousResponseError(error: unknown) {
+  const status = getAssistantErrorStatus(error);
+  const message = formatAssistantError(error).toLowerCase();
+
+  return (
+    (status === null || status === 400) &&
+    message.includes("not found") &&
+    (message.includes("previous response") ||
+      message.includes("previous_response_id"))
+  );
+}
+
+function canStartFreshAssistantTurn(requestData: VibePilotAssistantRequest) {
+  if (!requestData.previousResponseId) {
+    return false;
+  }
+
+  const messageItems = requestData.input.filter(
+    (item) => item.type === "message",
+  );
+
+  return (
+    messageItems.length === requestData.input.length &&
+    messageItems.some((item) => item.role === "user")
+  );
+}
+
+function shouldRetryFreshAssistantTurn(
+  error: unknown,
+  requestData: VibePilotAssistantRequest,
+) {
+  return (
+    canStartFreshAssistantTurn(requestData) &&
+    isMissingPreviousResponseError(error)
+  );
+}
+
+function buildFreshAssistantRequest(
+  requestData: VibePilotAssistantRequest,
+): VibePilotAssistantRequest {
+  return {
+    ...requestData,
+    previousResponseId: null,
+  };
+}
+
+function logFreshAssistantRetry(requestData: VibePilotAssistantRequest) {
+  logAssistantDebug("retrying without stale previous_response_id", {
+    previousResponseId: requestData.previousResponseId,
+  });
 }
 
 function getAssistantOutputText(response: OpenAIResponse) {
@@ -194,6 +256,57 @@ function createSseEvent(event: string, payload: unknown) {
   return `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
 }
 
+async function createAssistantResponse(
+  openai: OpenAI,
+  requestData: VibePilotAssistantRequest,
+  signal: AbortSignal,
+) {
+  try {
+    return await openai.responses.create(buildAssistantCreateParams(requestData), {
+      signal,
+    });
+  } catch (error) {
+    if (!shouldRetryFreshAssistantTurn(error, requestData)) {
+      throw error;
+    }
+
+    logFreshAssistantRetry(requestData);
+    return openai.responses.create(
+      buildAssistantCreateParams(buildFreshAssistantRequest(requestData)),
+      {
+        signal,
+      },
+    );
+  }
+}
+
+async function streamAssistantResponse(
+  openai: OpenAI,
+  requestData: VibePilotAssistantRequest,
+  signal: AbortSignal,
+  onAssistantTextDelta: (delta: string) => void,
+  setActiveStream: (stream: AssistantResponseStream | null) => void,
+) {
+  const stream = openai.responses.stream(buildAssistantCreateParams(requestData), {
+    signal,
+  });
+  setActiveStream(stream);
+
+  stream.on("response.output_text.delta", (event) => {
+    if (!event.delta) {
+      return;
+    }
+
+    onAssistantTextDelta(event.delta);
+  });
+
+  try {
+    return await stream.finalResponse();
+  } finally {
+    setActiveStream(null);
+  }
+}
+
 export async function POST(request: NextRequest) {
   const apiKey = getAssistantApiKey();
 
@@ -242,31 +355,58 @@ export async function POST(request: NextRequest) {
 
   if (wantsEventStream(request)) {
     const encoder = new TextEncoder();
-    const stream = openai.responses.stream(
-      buildAssistantCreateParams(parsedRequest.data),
-      {
-        signal: request.signal,
-      },
-    );
+    let activeStream: AssistantResponseStream | null = null;
 
     const responseStream = new ReadableStream<Uint8Array>({
       async start(controller) {
         const send = (event: string, data: unknown) => {
           controller.enqueue(encoder.encode(createSseEvent(event, data)));
         };
-
-        stream.on("response.output_text.delta", (event) => {
-          if (!event.delta) {
-            return;
-          }
-
-          send("assistant.text_delta", {
-            delta: event.delta,
-          });
-        });
+        let emittedTextDelta = false;
 
         try {
-          const finalResponse = await stream.finalResponse();
+          let finalResponse: OpenAIResponse;
+
+          try {
+            finalResponse = await streamAssistantResponse(
+              openai,
+              parsedRequest.data,
+              request.signal,
+              (delta) => {
+                emittedTextDelta = true;
+                send("assistant.text_delta", {
+                  delta,
+                });
+              },
+              (stream) => {
+                activeStream = stream;
+              },
+            );
+          } catch (error) {
+            if (
+              emittedTextDelta ||
+              !shouldRetryFreshAssistantTurn(error, parsedRequest.data)
+            ) {
+              throw error;
+            }
+
+            logFreshAssistantRetry(parsedRequest.data);
+            finalResponse = await streamAssistantResponse(
+              openai,
+              buildFreshAssistantRequest(parsedRequest.data),
+              request.signal,
+              (delta) => {
+                emittedTextDelta = true;
+                send("assistant.text_delta", {
+                  delta,
+                });
+              },
+              (stream) => {
+                activeStream = stream;
+              },
+            );
+          }
+
           logAssistantResponse(startedAt, finalResponse);
           send("assistant.response", buildAssistantResult(finalResponse));
         } catch (error) {
@@ -278,7 +418,7 @@ export async function POST(request: NextRequest) {
         }
       },
       cancel() {
-        stream.abort();
+        activeStream?.abort();
       },
     });
 
@@ -293,11 +433,10 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const response = await openai.responses.create(
-      buildAssistantCreateParams(parsedRequest.data),
-      {
-        signal: request.signal,
-      },
+    const response = await createAssistantResponse(
+      openai,
+      parsedRequest.data,
+      request.signal,
     );
 
     logAssistantResponse(startedAt, response);
