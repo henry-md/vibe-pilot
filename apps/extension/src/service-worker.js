@@ -2075,9 +2075,15 @@ async function getDomSummary() {
     throw new Error("Open a normal http(s) page before requesting a DOM summary.");
   }
 
-  const response = await chrome.tabs.sendMessage(tab.id, {
-    type: "VIBE_PILOT_GET_DOM_SUMMARY",
-  });
+  const response = await chrome.tabs.sendMessage(
+    tab.id,
+    {
+      type: "VIBE_PILOT_GET_DOM_SUMMARY",
+    },
+    {
+      frameId: 0,
+    },
+  );
 
   if (!response) {
     throw new Error("The content script did not return a DOM summary.");
@@ -2829,6 +2835,27 @@ const ASSISTANT_TOOL_EXECUTORS = {
       transcriptText: `Read the active tab: ${tab.title}.`,
     };
   },
+  async list_frames() {
+    const tab = await getRequiredTargetTab();
+    const frames = await getTabFrames(tab.id);
+    const activeRules = await loadActiveRules();
+    const result = {
+      frames: frames.map((frame) => ({
+        ...frame,
+        inspectable: isInspectableUrl(frame.url),
+        matchingActiveRuleCount: activeRules.filter((rule) =>
+          isInspectableUrl(frame.url) && matchesPattern(frame.url, rule.matchPattern),
+        ).length,
+      })),
+      tabId: tab.id,
+      url: tab.url,
+    };
+
+    return {
+      output: stringifyJson(result),
+      transcriptText: `Listed ${result.frames.length} frame${result.frames.length === 1 ? "" : "s"} in the active tab.`,
+    };
+  },
   async navigate_page(args) {
     const url =
       typeof args.url === "string" && args.url.trim() ? args.url.trim() : "";
@@ -2902,6 +2929,99 @@ const ASSISTANT_TOOL_EXECUTORS = {
         : `Scrolled the page to x=${Math.round(result.scrollX)}, y=${Math.round(result.scrollY)}.`,
     };
   },
+  async observe_dom(args) {
+    const selector =
+      typeof args.selector === "string" && args.selector.trim() ? args.selector.trim() : "";
+
+    if (!selector) {
+      throw new Error("observe_dom requires a non-empty selector.");
+    }
+
+    const result = await observeDomInTargetTab({
+      attributeNames: Array.isArray(args.attributeNames)
+        ? args.attributeNames.filter((value) => typeof value === "string").slice(0, 12)
+        : [],
+      includeText: args.includeText !== false,
+      maxItems: clampInteger(args.maxItems, 1, 12, 5),
+      quietWindowMs: clampInteger(
+        args.quietWindowMs,
+        50,
+        2000,
+        DOM_OBSERVE_DEFAULT_QUIET_WINDOW_MS,
+      ),
+      selector,
+      timeoutMs: clampInteger(
+        args.timeoutMs,
+        100,
+        10000,
+        DOM_OBSERVE_DEFAULT_TIMEOUT_MS,
+      ),
+    });
+
+    return {
+      output: stringifyJson(result),
+      transcriptText: `Observed "${selector}" for ${result.elapsedMs}ms; final count was ${result.final.count}.`,
+    };
+  },
+  async apply_dom_patch(args) {
+    const operations = Array.isArray(args.operations) ? args.operations : [];
+    if (!operations.length) {
+      throw new Error("apply_dom_patch requires at least one operation.");
+    }
+
+    const result = await applyDomPatchToTargetTab(args);
+
+    return {
+      output: stringifyJson(result),
+      transcriptText: `Applied ${result.changedCount} DOM patch${result.changedCount === 1 ? "" : "es"} across ${result.operationCount} operation${result.operationCount === 1 ? "" : "s"}.`,
+    };
+  },
+  async insert_page_css(args) {
+    const css =
+      typeof args.css === "string" && args.css.trim() ? args.css : "";
+
+    if (!css) {
+      throw new Error("insert_page_css requires non-empty css.");
+    }
+
+    const result = await insertCssIntoTargetTab(args);
+
+    return {
+      output: stringifyJson(result),
+      transcriptText: `Inserted CSS into ${formatInjectionTargetForTranscript(result.target)}.`,
+    };
+  },
+  async execute_page_script(args) {
+    const javascript =
+      typeof args.javascript === "string" && args.javascript.trim()
+        ? args.javascript
+        : "";
+
+    if (!javascript) {
+      throw new Error("execute_page_script requires non-empty javascript.");
+    }
+
+    if (javascript.length > ONE_OFF_SCRIPT_MAX_LENGTH) {
+      throw new Error(
+        `execute_page_script is limited to ${ONE_OFF_SCRIPT_MAX_LENGTH} characters. Put durable code in the draft instead.`,
+      );
+    }
+
+    const result = await executeOneOffPageScript(args);
+
+    return {
+      output: stringifyJson(result),
+      transcriptText: `Executed a ${result.world} script in ${formatInjectionTargetForTranscript(result.target)}.`,
+    };
+  },
+  async get_injection_state() {
+    const result = await getInjectionStateForTargetTab();
+
+    return {
+      output: stringifyJson(result),
+      transcriptText: `Read Vibe Pilot injection state for ${safeHostnameFromUrl(result.tab.url) ?? "the active tab"}.`,
+    };
+  },
   async take_screenshot(args) {
     const screenshot = await captureTargetTabScreenshot({
       label:
@@ -2944,6 +3064,7 @@ const ASSISTANT_TOOL_EXECUTORS = {
     const nextDraft = normalizeDraft({
       id: currentDraft.id,
       name: readAssistantDraftPatch(args, "name", currentDraft.name),
+      enabled: readAssistantDraftPatch(args, "enabled", currentDraft.enabled),
       matchPattern: readAssistantDraftPatch(
         args,
         "matchPattern",
@@ -2966,10 +3087,99 @@ const ASSISTANT_TOOL_EXECUTORS = {
     }
 
     await setWorkspaceDraft(nextDraft);
+    const liveUpdate = await syncUpdatedDraftToLiveTabs(nextDraft);
 
     return {
-      output: stringifyJson(nextDraft),
-      transcriptText: `Updated the current draft${nextDraft.name ? ` to "${nextDraft.name}"` : ""}.`,
+      output: stringifyJson({
+        draft: nextDraft,
+        liveUpdate,
+      }),
+      transcriptText: [
+        `Updated the current draft${nextDraft.name ? ` to "${nextDraft.name}"` : ""}.`,
+        liveUpdate.liveUpdated
+          ? `Synced it to ${liveUpdate.appliedTabCount ?? 0} matching tab${liveUpdate.appliedTabCount === 1 ? "" : "s"}.`
+          : liveUpdate.reason,
+      ].filter(Boolean).join(" "),
+    };
+  },
+  async write_draft_file(args) {
+    const filePath = normalizeRuleFilePath(args?.path);
+    if (!filePath) {
+      throw new Error("write_draft_file requires a non-empty file path.");
+    }
+
+    const currentDraft = (await loadWorkspaceDraft()) ?? EMPTY_WORKSPACE_RULE;
+    const currentFiles = normalizeRuleFiles(currentDraft.files);
+    const nextFile = {
+      path: filePath,
+      mimeType:
+        typeof args?.mimeType === "string" && args.mimeType.trim()
+          ? args.mimeType.trim()
+          : "",
+      content: typeof args?.content === "string" ? args.content : "",
+    };
+    const nextDraft = normalizeDraft({
+      ...currentDraft,
+      files: [
+        ...currentFiles.filter((file) => file.path !== filePath),
+        nextFile,
+      ],
+    });
+
+    await setWorkspaceDraft(nextDraft);
+    const liveUpdate = await syncUpdatedDraftToLiveTabs(nextDraft);
+
+    return {
+      output: stringifyJson({
+        draft: nextDraft,
+        file: nextFile,
+        liveUpdate,
+      }),
+      transcriptText: [
+        `Wrote draft file "${filePath}".`,
+        liveUpdate.liveUpdated
+          ? `Synced it to ${liveUpdate.appliedTabCount ?? 0} matching tab${
+              liveUpdate.appliedTabCount === 1 ? "" : "s"
+            }.`
+          : liveUpdate.reason,
+      ].filter(Boolean).join(" "),
+    };
+  },
+  async delete_draft_file(args) {
+    const filePath = normalizeRuleFilePath(args?.path);
+    if (!filePath) {
+      throw new Error("delete_draft_file requires a non-empty file path.");
+    }
+
+    const currentDraft = (await loadWorkspaceDraft()) ?? EMPTY_WORKSPACE_RULE;
+    const currentFiles = normalizeRuleFiles(currentDraft.files);
+    const nextFiles = currentFiles.filter((file) => file.path !== filePath);
+    const nextDraft = normalizeDraft({
+      ...currentDraft,
+      files: nextFiles,
+    });
+
+    await setWorkspaceDraft(nextDraft);
+    const liveUpdate = await syncUpdatedDraftToLiveTabs(nextDraft);
+    const deleted = nextFiles.length !== currentFiles.length;
+
+    return {
+      output: stringifyJson({
+        deleted,
+        draft: nextDraft,
+        liveUpdate,
+        path: filePath,
+      }),
+      transcriptText: [
+        deleted
+          ? `Deleted draft file "${filePath}".`
+          : `Draft file "${filePath}" was not present.`,
+        liveUpdate.liveUpdated
+          ? `Synced the draft to ${liveUpdate.appliedTabCount ?? 0} matching tab${
+              liveUpdate.appliedTabCount === 1 ? "" : "s"
+            }.`
+          : liveUpdate.reason,
+      ].filter(Boolean).join(" "),
     };
   },
   async apply_current_draft() {
@@ -2991,22 +3201,545 @@ const ASSISTANT_TOOL_EXECUTORS = {
   },
 };
 
+async function syncUpdatedDraftToLiveTabs(draft) {
+  if (!draft || draft.enabled === false) {
+    const activeRules = await loadActiveRules();
+    const previousDraft = activeRules.find((rule) =>
+      isSameRuleIdentity(rule, draft),
+    );
+
+    if (previousDraft) {
+      await unregisterLiveScript(previousDraft);
+      await clearInjectedRuleFromTabs(previousDraft);
+    }
+
+    await removeActiveRule(draft);
+    await syncActiveCssLoaderRegistration();
+    return {
+      liveUpdated: false,
+      reason: "The draft is disabled, so no live script was registered.",
+    };
+  }
+
+  if (!hasRuleContent(draft)) {
+    const activeRules = await loadActiveRules();
+    const previousDraft = activeRules.find((rule) =>
+      isSameRuleIdentity(rule, draft),
+    );
+
+    if (previousDraft) {
+      await unregisterLiveScript(previousDraft);
+      await clearInjectedRuleFromTabs(previousDraft);
+      await removeActiveRule(previousDraft);
+      await syncActiveCssLoaderRegistration();
+    }
+
+    return {
+      liveUpdated: false,
+      reason: "The draft has no injectable content.",
+    };
+  }
+
+  const result = await activateLiveRule(
+    draft,
+    "Registering the updated draft took too long. Try applying again.",
+  );
+
+  return {
+    ...result,
+    liveUpdated: true,
+  };
+}
+
+async function observeDomInTargetTab(payload) {
+  const tab = await getRequiredTargetTab();
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    world: "MAIN",
+    func: (config) =>
+      new Promise((resolve) => {
+        const startedAt = Date.now();
+        const selector = String(config.selector ?? "");
+        const maxItems = Number(config.maxItems) || 5;
+        const attributeNames = Array.isArray(config.attributeNames)
+          ? config.attributeNames.filter((value) => typeof value === "string").slice(0, 12)
+          : [];
+        const includeText = config.includeText !== false;
+        const quietWindowMs = Number(config.quietWindowMs) || 250;
+        const timeoutMs = Number(config.timeoutMs) || 1600;
+        let mutationCount = 0;
+        let completed = false;
+        let quietTimer = null;
+        let timeoutTimer = null;
+
+        const truncate = (value, limit) => {
+          const text = String(value ?? "").replace(/\s+/g, " ").trim();
+          return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
+        };
+
+        const summarizeElement = (node) => {
+          const rect = node.getBoundingClientRect();
+          const attributes = {};
+
+          for (const attributeName of attributeNames) {
+            const value = node.getAttribute(attributeName);
+            if (value != null) {
+              attributes[attributeName] = truncate(value, 240);
+            }
+          }
+
+          return {
+            attributes,
+            id: node.id || "",
+            tagName: node.tagName.toLowerCase(),
+            text: includeText ? truncate(node.textContent, 320) : "",
+            rect: {
+              height: Math.round(rect.height * 100) / 100,
+              left: Math.round(rect.left * 100) / 100,
+              top: Math.round(rect.top * 100) / 100,
+              width: Math.round(rect.width * 100) / 100,
+            },
+          };
+        };
+
+        const sample = () => {
+          const nodes = Array.from(document.querySelectorAll(selector));
+          return {
+            count: nodes.length,
+            samples: nodes.slice(0, maxItems).map(summarizeElement),
+          };
+        };
+
+        const observer = new MutationObserver((mutations) => {
+          mutationCount += mutations.length;
+          scheduleQuietFinish();
+        });
+
+        const cleanup = () => {
+          observer.disconnect();
+          if (quietTimer) {
+            clearTimeout(quietTimer);
+          }
+          if (timeoutTimer) {
+            clearTimeout(timeoutTimer);
+          }
+        };
+
+        const finish = (reason) => {
+          if (completed) {
+            return;
+          }
+
+          completed = true;
+          cleanup();
+          resolve({
+            elapsedMs: Date.now() - startedAt,
+            final: sample(),
+            initial,
+            mutationCount,
+            reason,
+            selector,
+            timestamp: new Date().toISOString(),
+            url: window.location.href,
+          });
+        };
+
+        function scheduleQuietFinish() {
+          if (quietTimer) {
+            clearTimeout(quietTimer);
+          }
+          quietTimer = setTimeout(() => finish("quiet"), quietWindowMs);
+        }
+
+        const initial = sample();
+        observer.observe(document.documentElement || document, {
+          attributes: true,
+          characterData: true,
+          childList: true,
+          subtree: true,
+        });
+        timeoutTimer = setTimeout(() => finish("timeout"), timeoutMs);
+        scheduleQuietFinish();
+      }),
+    args: [payload],
+  });
+
+  return result?.result ?? null;
+}
+
+async function applyDomPatchToTargetTab(args) {
+  const tab = await getRequiredTargetTab();
+  const operations = Array.isArray(args.operations) ? args.operations.slice(0, 50) : [];
+  const target = buildOneOffInjectionTarget(tab.id, args);
+  const results = await chrome.scripting.executeScript({
+    target,
+    world: "MAIN",
+    func: (patchOperations) => {
+      const normalizeOperationType = (value) =>
+        typeof value === "string" && value.trim() ? value.trim() : "";
+
+      const readSelector = (operation) =>
+        typeof operation.selector === "string" && operation.selector.trim()
+          ? operation.selector.trim()
+          : "";
+
+      const applyOperation = (operation) => {
+        const type = normalizeOperationType(operation.type);
+        const selector = readSelector(operation);
+
+        if (!selector) {
+          return {
+            changed: 0,
+            error: "Missing selector.",
+            selector,
+            type,
+          };
+        }
+
+        const nodes = Array.from(document.querySelectorAll(selector));
+        const targets = operation.all === true ? nodes : nodes.slice(0, 1);
+        let changed = 0;
+
+        for (const node of targets) {
+          if (type === "setText") {
+            node.textContent = String(operation.value ?? "");
+            changed += 1;
+          } else if (type === "setHtml") {
+            node.innerHTML = String(operation.value ?? "");
+            changed += 1;
+          } else if (type === "remove") {
+            node.remove();
+            changed += 1;
+          } else if (type === "setAttribute") {
+            const attributeName =
+              typeof operation.attributeName === "string" ? operation.attributeName.trim() : "";
+            if (attributeName) {
+              node.setAttribute(attributeName, String(operation.value ?? ""));
+              changed += 1;
+            }
+          } else if (type === "removeAttribute") {
+            const attributeName =
+              typeof operation.attributeName === "string" ? operation.attributeName.trim() : "";
+            if (attributeName) {
+              node.removeAttribute(attributeName);
+              changed += 1;
+            }
+          } else if (type === "setStyle") {
+            const propertyName =
+              typeof operation.propertyName === "string" ? operation.propertyName.trim() : "";
+            if (propertyName && node instanceof HTMLElement) {
+              node.style.setProperty(
+                propertyName,
+                String(operation.value ?? ""),
+                operation.priority === "important" ? "important" : "",
+              );
+              changed += 1;
+            }
+          } else if (type === "addClass") {
+            const className =
+              typeof operation.className === "string" ? operation.className.trim() : "";
+            if (className) {
+              node.classList.add(...className.split(/\s+/).filter(Boolean));
+              changed += 1;
+            }
+          } else if (type === "removeClass") {
+            const className =
+              typeof operation.className === "string" ? operation.className.trim() : "";
+            if (className) {
+              node.classList.remove(...className.split(/\s+/).filter(Boolean));
+              changed += 1;
+            }
+          } else if (type === "replaceText") {
+            const find = String(operation.find ?? "");
+            const replacement = String(operation.value ?? "");
+            if (find && node.textContent?.includes(find)) {
+              node.textContent = node.textContent.split(find).join(replacement);
+              changed += 1;
+            }
+          }
+        }
+
+        return {
+          changed,
+          matched: nodes.length,
+          selector,
+          type,
+        };
+      };
+
+      const operationResults = patchOperations.map(applyOperation);
+      return {
+        changedCount: operationResults.reduce(
+          (count, item) => count + (Number(item.changed) || 0),
+          0,
+        ),
+        operationResults,
+        url: window.location.href,
+      };
+    },
+    args: [operations],
+  });
+  const frameResults = normalizeInjectionResults(results);
+  const changedCount = frameResults.reduce(
+    (count, item) => count + (Number(item.result?.changedCount) || 0),
+    0,
+  );
+
+  return {
+    changedCount,
+    frameResults,
+    operationCount: operations.length,
+    target,
+  };
+}
+
+async function insertCssIntoTargetTab(args) {
+  const tab = await getRequiredTargetTab();
+  const css = typeof args.css === "string" ? args.css : "";
+  const target = buildOneOffInjectionTarget(tab.id, args);
+  const origin = args.origin === "AUTHOR" ? "AUTHOR" : "USER";
+
+  await chrome.scripting.insertCSS({
+    target,
+    css,
+    origin,
+  });
+
+  return {
+    cssLength: css.length,
+    origin,
+    target,
+  };
+}
+
+async function executeOneOffPageScript(args) {
+  const tab = await getRequiredTargetTab();
+  const javascript = typeof args.javascript === "string" ? args.javascript : "";
+  const target = buildOneOffInjectionTarget(tab.id, args);
+  const world = normalizeOneOffScriptWorld(args.world);
+  const source = `(async () => {\n${javascript}\n})()`;
+  let results;
+
+  if (chrome.userScripts?.execute) {
+    const availability = await getUserScriptsAvailability();
+    if (availability.available) {
+      results = await chrome.userScripts.execute({
+        target,
+        js: [{ code: source }],
+        injectImmediately: true,
+        world,
+      });
+
+      return {
+        resultCount: Array.isArray(results) ? results.length : 0,
+        results: normalizeInjectionResults(results),
+        target,
+        world,
+      };
+    }
+  }
+
+  if (world !== "MAIN") {
+    throw new Error(
+      "USER_SCRIPT world execution requires Chrome userScripts support. Enable Allow User Scripts for this extension, or run a MAIN-world diagnostic script.",
+    );
+  }
+
+  results = await chrome.scripting.executeScript({
+    target,
+    world: "MAIN",
+    func: (scriptSource) => (0, eval)(scriptSource),
+    args: [source],
+  });
+
+  return {
+    resultCount: Array.isArray(results) ? results.length : 0,
+    results: normalizeInjectionResults(results),
+    target,
+    world,
+  };
+}
+
+async function getInjectionStateForTargetTab() {
+  const tab = await getRequiredTargetTab();
+  const [activeRules, availability, registeredScriptIds, frames] = await Promise.all([
+    loadActiveRules(),
+    getUserScriptsAvailability(),
+    getRegisteredLiveScriptIds(),
+    getTabFrames(tab.id),
+  ]);
+  const frameIds = frames
+    .filter((frame) => isInspectableUrl(frame.url))
+    .map((frame) => frame.frameId);
+  const target = frameIds.length ? { tabId: tab.id, frameIds } : { tabId: tab.id };
+  let runtimeResults = [];
+
+  try {
+    runtimeResults = await chrome.scripting.executeScript({
+      target,
+      world: "MAIN",
+      func: () => {
+        const runtime = window.__VIBE_PILOT__;
+        return {
+          hostPresent: Boolean(document.getElementById("__vibe_pilot_host__")),
+          rootPresent: Boolean(document.getElementById("__vibe_pilot_root__")),
+          runtimePresent: Boolean(runtime),
+          runtimeMethods: runtime
+            ? Object.keys(runtime).filter((key) => typeof runtime[key] === "function").sort()
+            : [],
+          title: document.title,
+          url: window.location.href,
+        };
+      },
+    });
+  } catch (error) {
+    runtimeResults = [
+      {
+        frameId: 0,
+        error: error instanceof Error ? error.message : "Unable to inspect runtime state.",
+      },
+    ];
+  }
+
+  return {
+    activeRules: activeRules.map((rule) => ({
+      enabled: rule.enabled !== false,
+      hasCss: hasUserCss(rule),
+      hasHtml: hasHtml(rule),
+      hasJavascript: hasJavascript(rule),
+      id: rule.id,
+      matchPattern: rule.matchPattern,
+      name: rule.name,
+      runtimeKey: getRuleRuntimeKey(rule),
+    })),
+    frames,
+    registeredScriptIds,
+    runtimeResults: normalizeInjectionResults(runtimeResults),
+    tab: toTabDetails(tab),
+    userScripts: availability,
+  };
+}
+
+function buildOneOffInjectionTarget(tabId, args = {}) {
+  const frameIds = normalizeFrameIds(args.frameIds);
+
+  if (frameIds.length) {
+    return {
+      tabId,
+      frameIds,
+    };
+  }
+
+  if (args.allFrames === true) {
+    return {
+      tabId,
+      allFrames: true,
+    };
+  }
+
+  return {
+    tabId,
+  };
+}
+
+function normalizeFrameIds(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((frameId) => Number(frameId))
+    .filter((frameId) => Number.isInteger(frameId) && frameId >= 0)
+    .filter((frameId, index, frameIds) => frameIds.indexOf(frameId) === index)
+    .slice(0, 50);
+}
+
+function normalizeOneOffScriptWorld(value) {
+  if (value === "USER_SCRIPT" || value === "ISOLATED") {
+    return "USER_SCRIPT";
+  }
+
+  return "MAIN";
+}
+
+function normalizeInjectionResults(results) {
+  if (!Array.isArray(results)) {
+    return [];
+  }
+
+  return results.map((item) => ({
+    documentId:
+      typeof item?.documentId === "string" && item.documentId.trim()
+        ? item.documentId.trim()
+        : null,
+    error:
+      typeof item?.error === "string" && item.error.trim()
+        ? item.error.trim()
+        : null,
+    frameId: typeof item?.frameId === "number" ? item.frameId : 0,
+    result: normalizeToolResult(item?.result),
+  }));
+}
+
+function normalizeToolResult(value) {
+  if (typeof value === "string") {
+    return truncateToolString(value);
+  }
+
+  try {
+    const json = JSON.stringify(value);
+    if (typeof json === "string" && json.length > 8000) {
+      return {
+        truncated: true,
+        preview: `${json.slice(0, 7999)}…`,
+      };
+    }
+    return value ?? null;
+  } catch {
+    return String(value);
+  }
+}
+
+function truncateToolString(value) {
+  return value.length <= 8000 ? value : `${value.slice(0, 7999)}…`;
+}
+
+function formatInjectionTargetForTranscript(target) {
+  if (Array.isArray(target?.frameIds) && target.frameIds.length > 0) {
+    return `${target.frameIds.length} frame${target.frameIds.length === 1 ? "" : "s"}`;
+  }
+
+  return target?.allFrames ? "all frames" : "the main frame";
+}
+
 async function inspectPageWithContentScript(type, payload) {
   const tab = await getRequiredTargetTab();
   let response;
 
   try {
-    response = await chrome.tabs.sendMessage(tab.id, {
-      type,
-      payload,
-    });
+    response = await chrome.tabs.sendMessage(
+      tab.id,
+      {
+        type,
+        payload,
+      },
+      {
+        frameId: 0,
+      },
+    );
   } catch (error) {
     if (shouldRetryContentScriptMessage(error)) {
       await waitForContentScriptReady(tab.id);
-      response = await chrome.tabs.sendMessage(tab.id, {
-        type,
-        payload,
-      });
+      response = await chrome.tabs.sendMessage(
+        tab.id,
+        {
+          type,
+          payload,
+        },
+        {
+          frameId: 0,
+        },
+      );
     } else {
       throw error;
     }
@@ -3177,9 +3910,15 @@ async function waitForContentScriptReady(tabId, timeoutMs = 5000) {
 
   while (Date.now() - startedAt < timeoutMs) {
     try {
-      const response = await chrome.tabs.sendMessage(tabId, {
-        type: "VIBE_PILOT_PING",
-      });
+      const response = await chrome.tabs.sendMessage(
+        tabId,
+        {
+          type: "VIBE_PILOT_PING",
+        },
+        {
+          frameId: 0,
+        },
+      );
 
       if (response?.ok) {
         return response;
