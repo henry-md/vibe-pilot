@@ -4,7 +4,7 @@
   "scripts": {
     "dev": "node scripts/build-extension.mjs --watch",
     "build": "node scripts/build-extension.mjs",
-    "lint": "node --check src/content-script.js && node --check src/service-worker.js && node --check src/sidepanel.js"
+    "lint": "node --check src/content-script.js && node --check src/service-worker.js && node --check src/sidepanel.js && node --check src/style-loader.js"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.40"

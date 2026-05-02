@@ -6,15 +6,20 @@ import {
 } from "./default-draft.js";
 
 const ACTIVE_SCRIPT_ID = "vibe-pilot-live-script";
+const ACTIVE_SCRIPT_ID_PREFIX = "vibe-pilot-live-script-";
+const ACTIVE_CSS_LOADER_ID = "vibe-pilot-css-loader";
 const ASSISTANT_PROGRESS_PORT_NAME = "vibe-pilot-assistant-progress";
 const DEFAULT_REMOTE_BACKEND_URL = "https://vibe-pilotweb-production.up.railway.app";
 const LOCAL_BACKEND_URL = "http://127.0.0.1:3001";
 const OVERLAY_HOST_ID = "__vibe_pilot_host__";
 const OVERLAY_ROOT_ID = "__vibe_pilot_root__";
 const OVERLAY_STYLE_ID = "__vibe_pilot_style__";
+const STYLE_LOADER_FILE = "style-loader.js";
 const BACKEND_HEALTH_PROBE_TIMEOUT_MS = 1500;
 const BACKEND_HEALTH_CACHE_TTL_MS = 15000;
 const TAB_INJECTION_TIMEOUT_MS = 2500;
+const SCRIPTING_OPERATION_TIMEOUT_MS = 1800;
+const USER_CSS_REMOVAL_ATTEMPTS = 32;
 const RULE_BACKEND_TIMEOUT_MS = 8000;
 const ASSISTANT_BACKEND_TIMEOUT_MS = 120000;
 const ASSISTANT_MAX_TOOL_STEPS = 24;
@@ -60,8 +65,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   void maybeReapplyActiveDraftToTab(tabId, tab);
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  void handleMessage(message)
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  void handleMessage(message, sender)
     .then((payload) => sendResponse({ ok: true, payload }))
     .catch((error) => {
       sendResponse({
@@ -124,7 +129,7 @@ async function resetProjectStateIfNeeded() {
   });
 }
 
-async function handleMessage(message) {
+async function handleMessage(message, sender) {
   switch (message?.type) {
     case "VIBE_PILOT_GET_STATUS":
       return getStatusPayload();
@@ -138,6 +143,8 @@ async function handleMessage(message) {
       return getDomSummary();
     case "VIBE_PILOT_CLEAR_SCRIPT":
       return clearRegisteredScript();
+    case "VIBE_PILOT_APPLY_ACTIVE_CSS_TO_FRAME":
+      return applyActiveCssToSenderFrame(sender);
     case "VIBE_PILOT_PREPARE_HOT_RELOAD":
       return prepareHotReload(message.payload);
     case "VIBE_PILOT_RUN_ASSISTANT":
@@ -431,6 +438,78 @@ async function clearRegisteredScript() {
   };
 }
 
+async function activateLiveRule(draft, timeoutMessage) {
+  const activeRules = await loadActiveRules();
+  const previousDraft = activeRules.find((rule) =>
+    isSameRuleIdentity(rule, draft),
+  );
+  const shouldClearPreviousBeforeApply =
+    previousDraft &&
+    previousDraft.matchPattern !== draft.matchPattern;
+  const shouldClearPreviousCssAfterApply =
+    previousDraft &&
+    !shouldClearPreviousBeforeApply &&
+    previousDraft.css !== draft.css;
+
+  if (shouldClearPreviousBeforeApply) {
+    await clearInjectedRuleFromTabs(previousDraft);
+  }
+
+  await unregisterLiveScript(previousDraft ?? draft);
+  await setActiveRule(draft);
+  await syncActiveCssLoaderRegistration();
+  await withTimeout(registerLiveScript(draft), 4000, timeoutMessage);
+
+  const result = await injectIntoMatchingTabs(draft);
+
+  if (shouldClearPreviousCssAfterApply) {
+    await clearUserCssFromTabs(previousDraft);
+  }
+
+  return result;
+}
+
+async function reconcileActiveRulesWithBackendRules(rules) {
+  const enabledRules = rules.filter(
+    (rule) => rule.enabled !== false && hasRuleContent(rule),
+  );
+  const enabledKeys = new Set(enabledRules.map((rule) => getRuleRuntimeKey(rule)));
+  const activeRules = await loadActiveRules();
+  const rulesToRemove = activeRules.filter(
+    (rule) => !enabledKeys.has(getRuleRuntimeKey(rule)),
+  );
+
+  for (const rule of rulesToRemove) {
+    await unregisterLiveScript(rule);
+    await clearInjectedRuleFromTabs(rule);
+    if (hasJavascript(rule)) {
+      await reloadMatchingTabs(rule);
+    }
+  }
+
+  await setActiveRules(
+    activeRules.filter((rule) => enabledKeys.has(getRuleRuntimeKey(rule))),
+  );
+
+  for (const rule of enabledRules) {
+    const currentActiveRules = await loadActiveRules();
+    const storedRule = currentActiveRules.find((item) =>
+      isSameRuleIdentity(item, rule),
+    );
+
+    if (!storedRule || !rulesAreRuntimeEquivalent(storedRule, rule)) {
+      await activateLiveRule(
+        rule,
+        "Registering an enabled rule took too long. Try refreshing the page.",
+      );
+    } else {
+      await registerLiveScript(rule);
+    }
+  }
+
+  await syncActiveCssLoaderRegistration();
+}
+
 async function prepareHotReload(payload) {
   const draft = normalizeDraft(payload?.draft ?? payload ?? EMPTY_WORKSPACE_RULE);
   const targetTab = await getTargetTab();
@@ -448,18 +527,21 @@ async function prepareHotReload(payload) {
 }
 
 async function restoreRegisteredScript() {
-  const draft = await loadActiveDraft();
-  if (!draft) {
+  const activeRules = await loadActiveRules();
+  if (!activeRules.length) {
     return;
   }
 
-  const availability = await getUserScriptsAvailability();
-  if (!availability.available) {
-    await injectIntoMatchingTabs(draft);
-    return;
-  }
+  await syncActiveCssLoaderRegistration(activeRules);
+  await Promise.all(activeRules.map((draft) => registerLiveScript(draft)));
 
-  await registerLiveScript(draft);
+  await Promise.all(
+    activeRules.map((draft) =>
+      injectIntoMatchingTabs(draft).catch((error) => {
+        console.warn("Unable to restore an active rule into matching tabs.", error);
+      }),
+    ),
+  );
 }
 
 async function finalizeHotReload() {
@@ -490,30 +572,44 @@ async function finalizeHotReload() {
 }
 
 async function registerLiveScript(draft) {
+  if (!shouldRegisterUserScript(draft)) {
+    return;
+  }
+
   const availability = await getUserScriptsAvailability();
   if (!availability.available) {
     return;
   }
 
   const script = {
-    id: ACTIVE_SCRIPT_ID,
+    id: getLiveScriptId(draft),
     matches: [draft.matchPattern],
     js: [{ code: buildUserScriptCode(draft) }],
-    runAt: "document_idle",
+    allFrames: true,
+    runAt: "document_start",
     world: "MAIN",
   };
 
-  await unregisterLiveScript();
+  await unregisterLiveScript(draft);
   await chrome.userScripts.register([script]);
 }
 
-async function unregisterLiveScript() {
+async function unregisterLiveScript(draft) {
   if (!chrome.userScripts?.unregister) {
     return;
   }
 
   try {
-    await chrome.userScripts.unregister({ ids: [ACTIVE_SCRIPT_ID] });
+    const ids =
+      draft == null
+        ? await getRegisteredLiveScriptIds()
+        : [getLiveScriptId(draft)];
+
+    if (!ids.length) {
+      return;
+    }
+
+    await chrome.userScripts.unregister({ ids });
   } catch (error) {
     if (
       error instanceof Error &&
@@ -524,6 +620,88 @@ async function unregisterLiveScript() {
 
     throw error;
   }
+}
+
+async function registerActiveCssLoader() {
+  if (!chrome.scripting?.registerContentScripts) {
+    return;
+  }
+
+  if (chrome.scripting.getRegisteredContentScripts) {
+    const existing = await chrome.scripting.getRegisteredContentScripts({
+      ids: [ACTIVE_CSS_LOADER_ID],
+    });
+
+    if (existing.length) {
+      return;
+    }
+  }
+
+  const registration = {
+    id: ACTIVE_CSS_LOADER_ID,
+    matches: ["<all_urls>"],
+    js: [STYLE_LOADER_FILE],
+    runAt: "document_start",
+    allFrames: true,
+    persistAcrossSessions: true,
+  };
+
+  try {
+    await chrome.scripting.registerContentScripts([
+      {
+        ...registration,
+        matchOriginAsFallback: true,
+      },
+    ]);
+  } catch (error) {
+    await chrome.scripting.registerContentScripts([registration]);
+    console.warn(
+      "Registered the CSS loader without matchOriginAsFallback.",
+      error,
+    );
+  }
+}
+
+async function unregisterActiveCssLoader() {
+  if (!chrome.scripting?.unregisterContentScripts) {
+    return;
+  }
+
+  try {
+    if (chrome.scripting.getRegisteredContentScripts) {
+      const existing = await chrome.scripting.getRegisteredContentScripts({
+        ids: [ACTIVE_CSS_LOADER_ID],
+      });
+
+      if (!existing.length) {
+        return;
+      }
+    }
+
+    await chrome.scripting.unregisterContentScripts({
+      ids: [ACTIVE_CSS_LOADER_ID],
+    });
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.includes("Nonexistent script ID")
+    ) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function syncActiveCssLoaderRegistration(activeRules) {
+  const rules = Array.isArray(activeRules) ? activeRules : await loadActiveRules();
+
+  if (rules.some((rule) => shouldInjectUserCss(rule))) {
+    await registerActiveCssLoader();
+    return;
+  }
+
+  await unregisterActiveCssLoader();
 }
 
 async function injectIntoMatchingTabs(draft) {
@@ -587,6 +765,7 @@ async function injectIntoMatchingTabs(draft) {
 
 async function injectIntoTab(draft, tab) {
   try {
+    await insertUserCssIntoTab(draft, tab.id);
     await executeDraftInTab(draft, tab.id);
 
     return {
@@ -594,6 +773,10 @@ async function injectIntoTab(draft, tab) {
       tab,
     };
   } catch (error) {
+    await removeUserCssFromTab(draft, tab.id).catch(() => {
+      // Ignore cleanup failures after a partial injection.
+    });
+
     return {
       ok: false,
       tab,
@@ -605,12 +788,13 @@ async function injectIntoTab(draft, tab) {
 async function executeDraftInTab(draft, tabId, options = {}) {
   const allowUserScripts = options.allowUserScripts !== false;
   const source = buildUserScriptCode(draft);
+  const target = await buildDraftScriptInjectionTarget(draft, tabId);
 
   if (allowUserScripts) {
     const availability = await getUserScriptsAvailability();
     if (availability.available && chrome.userScripts?.execute) {
       await chrome.userScripts.execute({
-        target: { tabId },
+        target,
         js: [{ code: source }],
         injectImmediately: true,
         world: "MAIN",
@@ -620,7 +804,7 @@ async function executeDraftInTab(draft, tabId, options = {}) {
   }
 
   await chrome.scripting.executeScript({
-    target: { tabId },
+    target,
     world: "MAIN",
     func: (draftSource) => {
       // Execute the generated draft source in the page world when userScripts is unavailable.
@@ -628,6 +812,248 @@ async function executeDraftInTab(draft, tabId, options = {}) {
     },
     args: [source],
   });
+}
+
+async function buildDraftScriptInjectionTarget(draft, tabId) {
+  const frameIds = await getMatchingFrameIdsForTab(tabId, draft);
+
+  if (frameIds.length > 0) {
+    return {
+      tabId,
+      frameIds,
+    };
+  }
+
+  return {
+    tabId,
+  };
+}
+
+async function applyActiveCssToSenderFrame(sender) {
+  const activeRules = await loadActiveRules();
+  const tabId = sender?.tab?.id;
+  const frameId = sender?.frameId;
+
+  if (typeof tabId !== "number") {
+    return {
+      applied: false,
+    };
+  }
+
+  const matchingRules = activeRules.filter((rule) => {
+    if (!shouldInjectUserCss(rule)) {
+      return false;
+    }
+
+    if (typeof sender?.url === "string" && isInspectableUrl(sender.url)) {
+      return matchesPattern(sender.url, rule.matchPattern);
+    }
+
+    return true;
+  });
+
+  if (!matchingRules.length) {
+    return {
+      applied: false,
+    };
+  }
+
+  await Promise.all(
+    matchingRules.map((rule) =>
+      insertUserCssIntoTab(rule, tabId, {
+        frameIds: typeof frameId === "number" ? [frameId] : undefined,
+      }),
+    ),
+  );
+
+  return {
+    applied: true,
+    frameId: typeof frameId === "number" ? frameId : null,
+    ruleCount: matchingRules.length,
+  };
+}
+
+async function insertUserCssIntoTab(draft, tabId, targetOverrides = {}) {
+  if (!shouldInjectUserCss(draft) || typeof tabId !== "number") {
+    return false;
+  }
+
+  const target = buildCssInjectionTarget(tabId, targetOverrides);
+
+  await withTimeout(
+    chrome.scripting.insertCSS({
+      target,
+      css: draft.css,
+      origin: "USER",
+    }),
+    SCRIPTING_OPERATION_TIMEOUT_MS,
+    "Inserting rule CSS took too long.",
+  );
+
+  return true;
+}
+
+async function removeUserCssFromTab(draft, tabId, targetOverrides = {}) {
+  if (
+    !hasUserCss(draft) ||
+    typeof tabId !== "number" ||
+    !chrome.scripting?.removeCSS
+  ) {
+    return false;
+  }
+
+  const target = buildCssInjectionTarget(tabId, targetOverrides);
+  await withTimeout(
+    chrome.scripting.removeCSS({
+      target,
+      css: draft.css,
+      origin: "USER",
+    }),
+    SCRIPTING_OPERATION_TIMEOUT_MS,
+    "Removing rule CSS took too long.",
+  );
+
+  return true;
+}
+
+function buildCssInjectionTarget(tabId, overrides = {}) {
+  const frameIds = Array.isArray(overrides.frameIds)
+    ? overrides.frameIds.filter((frameId) => typeof frameId === "number")
+    : [];
+
+  if (frameIds.length) {
+    return {
+      tabId,
+      frameIds,
+    };
+  }
+
+  return {
+    tabId,
+    allFrames: true,
+  };
+}
+
+function shouldInjectUserCss(draft) {
+  return (
+    hasUserCss(draft) &&
+    draft.enabled !== false &&
+    Boolean(chrome.scripting?.insertCSS)
+  );
+}
+
+function shouldRegisterUserScript(draft) {
+  return (
+    Boolean(draft) &&
+    draft.enabled !== false &&
+    (hasHtml(draft) || hasJavascript(draft))
+  );
+}
+
+function hasUserCss(draft) {
+  return (
+    Boolean(draft) &&
+    typeof draft.css === "string" &&
+    draft.css.trim().length > 0
+  );
+}
+
+function hasHtml(draft) {
+  return (
+    Boolean(draft) &&
+    typeof draft.html === "string" &&
+    draft.html.trim().length > 0
+  );
+}
+
+function hasJavascript(draft) {
+  return (
+    Boolean(draft) &&
+    typeof draft.javascript === "string" &&
+    draft.javascript.trim().length > 0
+  );
+}
+
+function isSameRuleIdentity(left, right) {
+  const leftId = typeof left?.id === "string" ? left.id.trim() : "";
+  const rightId = typeof right?.id === "string" ? right.id.trim() : "";
+
+  if (leftId && rightId) {
+    return leftId === rightId;
+  }
+
+  return getRuleRuntimeKey(left) === getRuleRuntimeKey(right);
+}
+
+function normalizeActiveRules(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return dedupeRulesByRuntimeKey(
+    value
+      .map((rule) => normalizeDraft(rule))
+      .filter((rule) => rule.enabled !== false && hasRuleContent(rule)),
+  );
+}
+
+function dedupeRulesByRuntimeKey(rules) {
+  const rulesByKey = new Map();
+
+  for (const rule of rules) {
+    if (!rule) {
+      continue;
+    }
+
+    rulesByKey.set(getRuleRuntimeKey(rule), rule);
+  }
+
+  return Array.from(rulesByKey.values());
+}
+
+function getRuleRuntimeKey(rule) {
+  const id = typeof rule?.id === "string" && rule.id.trim() ? rule.id.trim() : "";
+  const rawKey = id || "workspace";
+  const normalizedKey = rawKey
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return normalizedKey || "workspace";
+}
+
+function getLiveScriptId(rule) {
+  return `${ACTIVE_SCRIPT_ID_PREFIX}${getRuleRuntimeKey(rule)}`;
+}
+
+async function getRegisteredLiveScriptIds() {
+  if (!chrome.userScripts?.getScripts) {
+    return [];
+  }
+
+  const scripts = await chrome.userScripts.getScripts();
+  return scripts
+    .map((script) => script.id)
+    .filter(
+      (id) =>
+        id === ACTIVE_SCRIPT_ID ||
+        (typeof id === "string" && id.startsWith(ACTIVE_SCRIPT_ID_PREFIX)),
+    );
+}
+
+function rulesAreRuntimeEquivalent(left, right) {
+  const normalizedLeft = normalizeDraft(left);
+  const normalizedRight = normalizeDraft(right);
+
+  return (
+    normalizedLeft.enabled === normalizedRight.enabled &&
+    normalizedLeft.matchPattern === normalizedRight.matchPattern &&
+    normalizedLeft.html === normalizedRight.html &&
+    normalizedLeft.css === normalizedRight.css &&
+    normalizedLeft.javascript === normalizedRight.javascript &&
+    JSON.stringify(normalizeRuleFiles(normalizedLeft.files)) ===
+      JSON.stringify(normalizeRuleFiles(normalizedRight.files))
+  );
 }
 
 function buildTabAccessError(tab, error) {
@@ -654,7 +1080,66 @@ function safeHostnameFromUrl(url) {
   }
 }
 
-async function clearInjectedOverlayFromTabs() {
+async function clearInjectedRuleFromTabs(draft) {
+  await Promise.all([
+    clearUserCssFromTabs(draft),
+    hasHtml(draft) || hasJavascript(draft)
+      ? clearInjectedOverlayFromTabs(draft)
+      : Promise.resolve(),
+  ]);
+}
+
+async function clearUserCssFromTabs(draft) {
+  if (!hasUserCss(draft) || !chrome.scripting?.removeCSS) {
+    return;
+  }
+
+  const tabs = await getInspectableTabs();
+  await Promise.all(
+    tabs
+      .map((tab) => tab.id)
+      .filter((tabId) => typeof tabId === "number")
+      .map((tabId) =>
+        removeUserCssCompletelyFromTab(draft, tabId).catch(() => {
+          // Ignore tabs that navigated, closed, or did not receive this stylesheet.
+        }),
+      ),
+  );
+}
+
+async function removeUserCssCompletelyFromTab(draft, tabId, targetOverrides = {}) {
+  for (let attempt = 0; attempt < USER_CSS_REMOVAL_ATTEMPTS; attempt += 1) {
+    await removeUserCssFromTab(draft, tabId, targetOverrides);
+  }
+}
+
+async function reloadMatchingTabs(draft) {
+  const tabs = await getMatchingTabs(draft);
+  const targetTabIds = tabs
+    .map((tab) => tab.id)
+    .filter((tabId) => typeof tabId === "number");
+
+  if (!targetTabIds.length) {
+    return 0;
+  }
+
+  const results = await Promise.all(
+    targetTabIds.map(async (tabId) => {
+      try {
+        await chrome.tabs.reload(tabId);
+        await waitForTabComplete(tabId, 12000);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
+  );
+
+  return results.filter(Boolean).length;
+}
+
+async function clearInjectedOverlayFromTabs(draft = null) {
+  const runtimeKey = draft ? getRuleRuntimeKey(draft) : null;
   const tabs = await getInspectableTabs();
   const targetTabIds = tabs
     .map((tab) => tab.id)
@@ -666,23 +1151,47 @@ async function clearInjectedOverlayFromTabs() {
 
   await Promise.all(
     targetTabIds.map((tabId) =>
-      chrome.scripting.executeScript({
-        target: { tabId },
-        world: "MAIN",
-        func: (hostId, rootId, styleId) => {
-          const runtime = window.__VIBE_PILOT__;
-          if (runtime?.destroy) {
-            runtime.destroy();
-            return;
-          }
+      withTimeout(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          world: "MAIN",
+          func: (hostId, rootId, styleId, clearAll, expectedRuntimeKey) => {
+            const runtime = window.__VIBE_PILOT__;
+            const shouldDestroyRuntime =
+              clearAll ||
+              !expectedRuntimeKey ||
+              runtime?.ruleRuntimeKey === expectedRuntimeKey;
 
-          document.getElementById(hostId)?.remove();
-          document.getElementById(rootId)?.remove();
-          document.getElementById(styleId)?.remove();
-          delete window.__VIBE_PILOT__;
-        },
-        args: [OVERLAY_HOST_ID, OVERLAY_ROOT_ID, OVERLAY_STYLE_ID],
-      }).catch(() => {
+            if (shouldDestroyRuntime && runtime?.destroy) {
+              runtime.destroy();
+            }
+
+            if (shouldDestroyRuntime) {
+              document.getElementById(hostId)?.remove();
+              document.getElementById(rootId)?.remove();
+              document.getElementById(styleId)?.remove();
+            }
+
+            if (clearAll) {
+              for (const node of document.querySelectorAll(
+                '[data-vibe-pilot="host"]',
+              )) {
+                node.remove();
+              }
+              delete window.__VIBE_PILOT__;
+            }
+          },
+          args: [
+            OVERLAY_HOST_ID,
+            OVERLAY_ROOT_ID,
+            OVERLAY_STYLE_ID,
+            draft == null,
+            runtimeKey,
+          ],
+        }),
+        SCRIPTING_OPERATION_TIMEOUT_MS,
+        "Clearing the injected rule UI took too long.",
+      ).catch(() => {
         // Ignore tabs that reject scripting while closing or changing origin.
       }),
     ),
@@ -691,22 +1200,27 @@ async function clearInjectedOverlayFromTabs() {
 
 function buildUserScriptCode(draft) {
   const html = JSON.stringify(draft.html);
-  const css = JSON.stringify(draft.css);
   const javascript = draft.javascript || "";
   const files = JSON.stringify(normalizeRuleFiles(draft.files));
+  const runtimeKey = JSON.stringify(getRuleRuntimeKey(draft));
 
   return `
 (() => {
-  if (window.__VIBE_PILOT__?.destroy) {
-    window.__VIBE_PILOT__.destroy();
+  const previousRuntime = window.__VIBE_PILOT__;
+  if (previousRuntime && typeof previousRuntime.destroy === "function") {
+    try {
+      previousRuntime.destroy();
+    } catch (error) {
+      console.warn("Unable to destroy the previous Vibe Pilot runtime.", error);
+    }
   }
 
   const htmlSnippet = ${html};
-  const cssSnippet = ${css};
   const fileEntries = ${files};
   const hostId = "${OVERLAY_HOST_ID}";
   const rootId = "${OVERLAY_ROOT_ID}";
   const styleId = "${OVERLAY_STYLE_ID}";
+  const ruleRuntimeKey = ${runtimeKey};
 
   const normalizeFilePath = (value) =>
     String(value ?? "")
@@ -866,27 +1380,7 @@ function buildUserScriptCode(draft) {
     return host;
   };
 
-  const ensureStyle = () => {
-    if (!cssSnippet) {
-      return;
-    }
-
-    const host = ensureHost();
-    if (!host) {
-      return;
-    }
-
-    let style = document.getElementById(styleId);
-    if (!style) {
-      style = document.createElement("style");
-      style.id = styleId;
-      host.appendChild(style);
-    }
-
-    if (style.textContent !== cssSnippet) {
-      style.textContent = cssSnippet;
-    }
-  };
+  const ensureStyle = () => false;
 
   const ensureRoot = () => {
     if (!htmlSnippet) {
@@ -915,8 +1409,97 @@ function buildUserScriptCode(draft) {
     return root;
   };
 
+  const cleanupCallbacks = new Set();
+  const managedIntervals = new Set();
+  const managedObservers = new Set();
+  const managedTimeouts = new Set();
+  let rerenderObserver = null;
+  let isDestroyed = false;
+
+  const runManagedCleanup = () => {
+    for (const observer of Array.from(managedObservers)) {
+      try {
+        observer.disconnect();
+      } catch {
+        // Ignore observer cleanup failures.
+      }
+    }
+    managedObservers.clear();
+
+    for (const timeoutId of Array.from(managedTimeouts)) {
+      clearTimeout(timeoutId);
+    }
+    managedTimeouts.clear();
+
+    for (const intervalId of Array.from(managedIntervals)) {
+      clearInterval(intervalId);
+    }
+    managedIntervals.clear();
+
+    for (const callback of Array.from(cleanupCallbacks)) {
+      try {
+        callback();
+      } catch (error) {
+        console.warn("A Vibe Pilot cleanup callback failed.", error);
+      }
+    }
+    cleanupCallbacks.clear();
+  };
+
+  const registerCleanup = (callback) => {
+    if (typeof callback !== "function") {
+      return () => {};
+    }
+
+    cleanupCallbacks.add(callback);
+    return () => {
+      cleanupCallbacks.delete(callback);
+    };
+  };
+
+  const isManagedNode = (node) => {
+    if (!node || typeof node.closest !== "function") {
+      return false;
+    }
+
+    return Boolean(
+      node.closest(
+        "#" + hostId + ",#" + rootId + ",[data-vibe-pilot=\\"host\\"],[data-vibe-pilot=\\"managed\\"],script,style,noscript,template",
+      ),
+    );
+  };
+
+  const isVisibleElement = (node) => {
+    if (!(node instanceof Element) || isManagedNode(node)) {
+      return false;
+    }
+
+    const style = window.getComputedStyle(node);
+    if (
+      style.display === "none" ||
+      style.visibility === "hidden" ||
+      style.visibility === "collapse" ||
+      style.opacity === "0"
+    ) {
+      return false;
+    }
+
+    return Array.from(node.getClientRects()).some(
+      (rect) => rect.width > 0 && rect.height > 0,
+    );
+  };
+
+  const normalizeSelectorList = (value) => {
+    const rawValues = Array.isArray(value) ? value : [value];
+
+    return rawValues
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+  };
+
   const api = {
     hostId,
+    ruleRuntimeKey,
     rootId,
     styleId,
     ensureHost,
@@ -941,6 +1524,88 @@ function buildUserScriptCode(draft) {
       hydrateManagedAssetLinks(node);
       return true;
     },
+    replaceVisibleText(selectors, value, options = {}) {
+      const selectorList = normalizeSelectorList(selectors);
+      const replacement = String(value ?? "");
+      const markerName =
+        typeof options.markAttribute === "string" &&
+        /^data-[a-zA-Z0-9_.:-]+$/.test(options.markAttribute.trim())
+          ? options.markAttribute.trim()
+          : "";
+      const maxChanges = Number.isFinite(options.maxChanges)
+        ? Math.max(1, Math.min(5000, Math.round(options.maxChanges)))
+        : 1000;
+      const shouldPatchInputs = options.includeInputs === true;
+      const stopAfterFirst = options.all === false;
+      const seen = new Set();
+      const selectorErrors = [];
+      let changed = 0;
+      let matched = 0;
+      let skipped = 0;
+
+      for (const selector of selectorList) {
+        let nodes;
+
+        try {
+          nodes = Array.from(document.querySelectorAll(selector));
+        } catch (error) {
+          selectorErrors.push({
+            selector,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          continue;
+        }
+
+        for (const node of nodes) {
+          if (seen.has(node)) {
+            continue;
+          }
+
+          seen.add(node);
+          matched += 1;
+
+          if (changed >= maxChanges || (stopAfterFirst && changed > 0)) {
+            skipped += 1;
+            continue;
+          }
+
+          if (
+            shouldPatchInputs &&
+            (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement)
+          ) {
+            node.value = replacement;
+            node.dispatchEvent(new Event("input", { bubbles: true }));
+            if (markerName) {
+              node.setAttribute(markerName, "1");
+            }
+            changed += 1;
+            continue;
+          }
+
+          if (!isVisibleElement(node)) {
+            skipped += 1;
+            continue;
+          }
+
+          if (node.textContent !== replacement) {
+            node.textContent = replacement;
+          }
+
+          if (markerName) {
+            node.setAttribute(markerName, "1");
+          }
+
+          changed += 1;
+        }
+      }
+
+      return {
+        changed,
+        matched,
+        selectorErrors,
+        skipped,
+      };
+    },
     remove(selector) {
       const node = document.querySelector(selector);
       if (!node) {
@@ -949,6 +1614,55 @@ function buildUserScriptCode(draft) {
 
       node.remove();
       return true;
+    },
+    onCleanup(callback) {
+      return registerCleanup(callback);
+    },
+    observe(target, options, callback) {
+      const resolvedTarget =
+        typeof target === "string" ? document.querySelector(target) : target;
+      if (!resolvedTarget || typeof callback !== "function") {
+        return null;
+      }
+
+      const observer = new MutationObserver(callback);
+      observer.observe(resolvedTarget, options || { childList: true, subtree: true });
+      managedObservers.add(observer);
+      return {
+        disconnect() {
+          observer.disconnect();
+          managedObservers.delete(observer);
+        },
+      };
+    },
+    setTimeout(callback, delay = 0) {
+      if (typeof callback !== "function") {
+        return null;
+      }
+
+      const timeoutId = window.setTimeout(() => {
+        managedTimeouts.delete(timeoutId);
+        callback();
+      }, delay);
+      managedTimeouts.add(timeoutId);
+      return timeoutId;
+    },
+    clearTimeout(timeoutId) {
+      clearTimeout(timeoutId);
+      managedTimeouts.delete(timeoutId);
+    },
+    setInterval(callback, delay = 0) {
+      if (typeof callback !== "function") {
+        return null;
+      }
+
+      const intervalId = window.setInterval(callback, delay);
+      managedIntervals.add(intervalId);
+      return intervalId;
+    },
+    clearInterval(intervalId) {
+      clearInterval(intervalId);
+      managedIntervals.delete(intervalId);
     },
     listFiles() {
       return Array.from(filesByPath.values()).map((file) => ({
@@ -978,7 +1692,13 @@ function buildUserScriptCode(draft) {
       return ensureFileUrl(path);
     },
     destroy() {
-      rerenderObserver.disconnect();
+      if (isDestroyed) {
+        return;
+      }
+
+      isDestroyed = true;
+      runManagedCleanup();
+      rerenderObserver?.disconnect();
       revokeFileUrls();
       document.getElementById(rootId)?.remove();
       document.getElementById(styleId)?.remove();
@@ -988,11 +1708,9 @@ function buildUserScriptCode(draft) {
   };
 
   window.__VIBE_PILOT__ = api;
-  ensureStyle();
   ensureRoot();
 
-  const rerenderObserver = new MutationObserver(() => {
-    ensureStyle();
+  rerenderObserver = new MutationObserver(() => {
     ensureRoot();
   });
 
@@ -1175,11 +1893,14 @@ function isLegacySeededExample(draft) {
 async function hasRegisteredLiveScript() {
   const availability = await getUserScriptsAvailability();
   if (!availability.available) {
-    return Boolean(await loadActiveDraft());
+    return (await loadActiveRules()).length > 0;
   }
 
-  const scripts = await chrome.userScripts.getScripts({ ids: [ACTIVE_SCRIPT_ID] });
-  return scripts.length > 0;
+  if ((await getRegisteredLiveScriptIds()).length > 0) {
+    return true;
+  }
+
+  return (await loadActiveRules()).some((rule) => shouldInjectUserCss(rule));
 }
 
 async function getUserScriptsAvailability() {
@@ -1205,8 +1926,8 @@ async function getUserScriptsAvailability() {
 }
 
 async function maybeReapplyActiveDraftToTab(tabId, tabOverride) {
-  const draft = await loadActiveDraft();
-  if (!draft) {
+  const activeRules = await loadActiveRules();
+  if (!activeRules.length) {
     return;
   }
 
@@ -1219,17 +1940,35 @@ async function maybeReapplyActiveDraftToTab(tabId, tabOverride) {
     tabOverride ??
     await chrome.tabs.get(tabId).catch(() => null);
 
-  if (!tab?.id || !matchesPattern(tab.url, draft.matchPattern)) {
+  if (!tab?.id) {
     return;
   }
 
-  try {
-    await executeDraftInTab(draft, tab.id, {
-      allowUserScripts: false,
-    });
-  } catch (error) {
-    console.warn("Unable to reapply the active draft after tab load.", error);
+  const matchingRules = activeRules.filter((draft) =>
+    matchesPattern(tab.url, draft.matchPattern),
+  );
+
+  await Promise.all(
+    matchingRules.map((draft) =>
+      insertUserCssIntoTab(draft, tab.id).catch((error) => {
+        console.warn("Unable to reapply active rule CSS after tab load.", error);
+      }),
+    ),
+  );
+
+  if (availability.available) {
+    return;
   }
+
+  await Promise.all(
+    matchingRules.map((draft) =>
+      executeDraftInTab(draft, tab.id, {
+        allowUserScripts: false,
+      }).catch((error) => {
+        console.warn("Unable to reapply an active rule after tab load.", error);
+      }),
+    ),
+  );
 }
 
 async function getTargetTab() {
@@ -1266,6 +2005,51 @@ async function getMatchingTabs(draft) {
   return tabs.filter((tab) =>
     typeof tab.id === "number" && matchesPattern(tab.url, draft.matchPattern),
   );
+}
+
+async function getTabFrames(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  const fallbackFrame = {
+    documentId: null,
+    errorOccurred: false,
+    frameId: 0,
+    parentFrameId: -1,
+    url: tab?.url ?? "",
+  };
+
+  if (!chrome.webNavigation?.getAllFrames) {
+    return [fallbackFrame];
+  }
+
+  try {
+    const frames = await chrome.webNavigation.getAllFrames({ tabId });
+    if (Array.isArray(frames) && frames.length > 0) {
+      return frames.map((frame) => ({
+        documentId:
+          typeof frame.documentId === "string" && frame.documentId.trim()
+            ? frame.documentId.trim()
+            : null,
+        errorOccurred: frame.errorOccurred === true,
+        frameId: typeof frame.frameId === "number" ? frame.frameId : 0,
+        parentFrameId:
+          typeof frame.parentFrameId === "number" ? frame.parentFrameId : -1,
+        url: typeof frame.url === "string" ? frame.url : "",
+      }));
+    }
+  } catch (error) {
+    console.warn("Unable to list tab frames.", error);
+  }
+
+  return [fallbackFrame];
+}
+
+async function getMatchingFrameIdsForTab(tabId, draft) {
+  const frames = await getTabFrames(tabId);
+  return frames
+    .filter((frame) => isInspectableUrl(frame.url))
+    .filter((frame) => matchesPattern(frame.url, draft.matchPattern))
+    .map((frame) => frame.frameId)
+    .filter((frameId, index, frameIds) => frameIds.indexOf(frameId) === index);
 }
 
 async function getTargetTabDetails() {

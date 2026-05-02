@@ -9,7 +9,8 @@
     "sidePanel",
     "storage",
     "tabs",
-    "userScripts"
+    "userScripts",
+    "webNavigation"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -58,7 +59,9 @@
       "js": [
         "content-script.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_start",
+      "all_frames": true,
+      "match_origin_as_fallback": true
     }
   ]
 }
