@@ -1,4 +1,5 @@
 export const DEFAULT_DRAFT = {
+  enabled: true,
   matchPattern: "*://*/*",
   html: ['<div class="vp-sample-pill">Hello world</div>'].join("\n"),
   css: [
@@ -60,6 +61,7 @@ export const RED_TEXT_STARTER_WORKSPACE_RULE = {
 };
 
 export const EMPTY_DRAFT = {
+  enabled: true,
   matchPattern: DEFAULT_DRAFT.matchPattern,
   html: "",
   css: "",

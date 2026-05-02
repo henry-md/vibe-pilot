@@ -10,6 +10,7 @@ datasource db {
 model Rule {
   id           String   @id @default(cuid())
   name         String
+  enabled      Boolean  @default(true)
   matchPattern String   @default("*://*/*")
   html         String   @default("") @db.Text
   css          String   @default("") @db.Text

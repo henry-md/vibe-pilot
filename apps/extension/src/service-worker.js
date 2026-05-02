@@ -24,10 +24,14 @@ const SCREENSHOT_CAPTURE_COOLDOWN_MS = 550;
 const SCREENSHOT_PREVIEW_MAX_WIDTH = 960;
 const SCREENSHOT_PREVIEW_MAX_HEIGHT = 960;
 const SCREENSHOT_PREVIEW_QUALITY = 0.68;
+const DOM_OBSERVE_DEFAULT_TIMEOUT_MS = 1600;
+const DOM_OBSERVE_DEFAULT_QUIET_WINDOW_MS = 250;
+const ONE_OFF_SCRIPT_MAX_LENGTH = 50000;
 const FILE_LAYOUT_STORAGE_KEY = "vibePilotFileLayout";
 const PROJECT_STATE_RESET_VERSION = 2;
 const STORAGE_KEYS = {
   activeDraft: "vibePilotDraft",
+  activeRules: "vibePilotActiveRules",
   projectsResetVersion: "vibePilotProjectsResetVersion",
   workspaceDraft: "vibePilotWorkspaceDraft",
   pendingHotReload: "vibePilotPendingHotReload",
@@ -109,6 +113,7 @@ async function resetProjectStateIfNeeded() {
   await clearRegisteredScript();
   await chrome.storage.local.remove([
     STORAGE_KEYS.activeDraft,
+    STORAGE_KEYS.activeRules,
     STORAGE_KEYS.workspaceDraft,
     STORAGE_KEYS.pendingHotReload,
     STORAGE_KEYS.pendingHotReloadTabId,
@@ -143,6 +148,8 @@ async function handleMessage(message) {
       return listRules();
     case "VIBE_PILOT_GET_RULE":
       return getRule(message.payload);
+    case "VIBE_PILOT_SET_RULE_ENABLED":
+      return setRuleEnabled(message.payload);
     case "VIBE_PILOT_DELETE_RULE":
       return deleteRule(message.payload);
     default:
@@ -193,20 +200,23 @@ async function saveRule(payload) {
 }
 
 async function applyDraft(payload) {
-  const draft = normalizeDraft(payload);
-  const persistedRule = normalizeRuleRecord(payload);
+  const draft = {
+    ...normalizeDraft(payload),
+    enabled: true,
+  };
+  const persistedRule = {
+    ...normalizeRuleRecord(payload),
+    enabled: true,
+  };
 
   if (!draft.name) {
     throw new Error("Give this rule a name before you apply it.");
   }
 
-  await setActiveDraft(draft);
-  await withTimeout(
-    registerLiveScript(draft),
-    4000,
+  const injectionResult = await activateLiveRule(
+    draft,
     "Registering the live rule took too long. Try applying again.",
   );
-  const injectionResult = await injectIntoMatchingTabs(draft);
 
   let remoteSaved = false;
   let backendUrl = await getPreferredBackendBaseUrl();
@@ -216,7 +226,11 @@ async function applyDraft(payload) {
     savedRule = response.rule ? normalizeRuleRecord(response.rule) : null;
     backendUrl = response.backendUrl ?? backendUrl;
     if (savedRule) {
-      await setActiveDraft(savedRule);
+      await unregisterLiveScript(draft);
+      await removeActiveRule(draft);
+      await setActiveRule(savedRule);
+      await syncActiveCssLoaderRegistration();
+      await registerLiveScript(savedRule);
     }
     remoteSaved = true;
   } catch (error) {
@@ -246,12 +260,18 @@ async function listRules() {
     },
   );
 
+  const rules = Array.isArray(response.rules)
+    ? response.rules.map((rule) => normalizeRuleRecord(rule))
+    : [];
+
+  await reconcileActiveRulesWithBackendRules(rules).catch((error) => {
+    console.warn("Unable to sync active rules from the backend.", error);
+  });
+
   return {
     backendUrl,
     ...response,
-    rules: Array.isArray(response.rules)
-      ? response.rules.map((rule) => normalizeRuleRecord(rule))
-      : [],
+    rules,
   };
 }
 
@@ -290,6 +310,7 @@ async function deleteRule(payload) {
     throw new Error("A rule id is required before deleting.");
   }
 
+  const activeRule = (await loadActiveRules()).find((rule) => rule.id === ruleId);
   const { backendUrl, payload: response } = await fetchBackendJson(
     `/api/rules/${ruleId}`,
     {
@@ -300,10 +321,12 @@ async function deleteRule(payload) {
     },
   );
 
-  const activeDraft = await loadActiveDraft();
-  if (activeDraft?.id === ruleId) {
-    await clearRegisteredScript();
+  await unregisterLiveScript({ id: ruleId });
+  if (activeRule) {
+    await clearInjectedRuleFromTabs(activeRule);
   }
+  await removeActiveRule({ id: ruleId });
+  await syncActiveCssLoaderRegistration();
 
   return {
     backendUrl,
@@ -311,13 +334,96 @@ async function deleteRule(payload) {
   };
 }
 
-async function clearRegisteredScript() {
-  if (chrome.userScripts) {
-    await unregisterLiveScript();
+async function setRuleEnabled(payload) {
+  const ruleId =
+    typeof payload?.ruleId === "string" && payload.ruleId.trim()
+      ? payload.ruleId.trim()
+      : "";
+  const enabled = payload?.enabled === true;
+
+  if (!ruleId) {
+    throw new Error("A rule id is required before updating it.");
   }
 
-  await chrome.storage.local.remove(STORAGE_KEYS.activeDraft);
+  const { backendUrl: detailBackendUrl, payload: detail } =
+    await fetchBackendJson(
+      `/api/rules/${ruleId}`,
+      undefined,
+      {
+        timeoutMs: RULE_BACKEND_TIMEOUT_MS,
+      },
+    );
+  const existingRule = detail.rule ? normalizeRuleRecord(detail.rule) : null;
 
+  if (!existingRule) {
+    throw new Error("Rule not found.");
+  }
+
+  const nextRule = {
+    ...existingRule,
+    enabled,
+  };
+
+  if (enabled && !hasRuleContent(nextRule)) {
+    throw new Error("Add code to at least one file before turning this rule on.");
+  }
+
+  const response = await persistRule(nextRule);
+  const savedRule = response.rule ? normalizeRuleRecord(response.rule) : nextRule;
+
+  if (enabled) {
+    const injectionResult = await activateLiveRule(
+      savedRule,
+      "Registering the live rule took too long. Try turning it on again.",
+    );
+
+    return {
+      applied: true,
+      backendUrl: response.backendUrl ?? detailBackendUrl,
+      rule: savedRule,
+      ...injectionResult,
+    };
+  }
+
+  await clearInjectedRuleFromTabs(savedRule);
+  await unregisterLiveScript(savedRule);
+  await removeActiveRule(savedRule);
+  await syncActiveCssLoaderRegistration();
+
+  const reloadedTabCount = hasJavascript(savedRule)
+    ? await reloadMatchingTabs(savedRule)
+    : 0;
+
+  const workspaceDraft = await loadWorkspaceDraft();
+  if (workspaceDraft?.id === ruleId) {
+    await setWorkspaceDraft(savedRule);
+  }
+
+  return {
+    applied: false,
+    backendUrl: response.backendUrl ?? detailBackendUrl,
+    reloadedTabCount,
+    rule: savedRule,
+  };
+}
+
+async function clearRegisteredScript() {
+  const activeRules = await loadActiveRules();
+  const activeDraft = await loadActiveDraft();
+  const rulesToClear = dedupeRulesByRuntimeKey([
+    ...activeRules,
+    ...(activeDraft ? [activeDraft] : []),
+  ]);
+
+  await unregisterLiveScript();
+  await unregisterActiveCssLoader();
+  await chrome.storage.local.remove([
+    STORAGE_KEYS.activeDraft,
+    STORAGE_KEYS.activeRules,
+  ]);
+  await Promise.all(
+    rulesToClear.map((rule) => clearInjectedRuleFromTabs(rule)),
+  );
   await clearInjectedOverlayFromTabs();
 
   return {
@@ -914,6 +1020,18 @@ async function loadActiveDraft() {
   return loadStoredDraft(STORAGE_KEYS.activeDraft);
 }
 
+async function loadActiveRules() {
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.activeRules);
+  const activeRules = normalizeActiveRules(stored[STORAGE_KEYS.activeRules]);
+
+  if (activeRules.length) {
+    return activeRules;
+  }
+
+  const activeDraft = await loadActiveDraft();
+  return normalizeActiveRules(activeDraft ? [activeDraft] : []);
+}
+
 async function loadStoredDraft(storageKey) {
   const stored = await chrome.storage.local.get(storageKey);
   const rawDraft = stored[storageKey];
@@ -944,15 +1062,60 @@ async function setActiveDraft(draft) {
   });
 }
 
+async function setActiveRules(rules) {
+  const activeRules = dedupeRulesByRuntimeKey(normalizeActiveRules(rules));
+  const updates = {
+    [STORAGE_KEYS.activeRules]: activeRules,
+  };
+  const removals = [];
+
+  if (activeRules.length) {
+    updates[STORAGE_KEYS.activeDraft] = activeRules[activeRules.length - 1];
+  } else {
+    removals.push(STORAGE_KEYS.activeDraft);
+  }
+
+  await chrome.storage.local.set(updates);
+
+  if (removals.length) {
+    await chrome.storage.local.remove(removals);
+  }
+
+  return activeRules;
+}
+
+async function setActiveRule(draft) {
+  const activeRules = await loadActiveRules();
+  const nextRule = normalizeDraft(draft);
+  const nextRules = activeRules.filter(
+    (rule) => !isSameRuleIdentity(rule, nextRule),
+  );
+
+  nextRules.push(nextRule);
+  return setActiveRules(nextRules);
+}
+
+async function removeActiveRule(draft) {
+  const activeRules = await loadActiveRules();
+  const nextRules = activeRules.filter(
+    (rule) => !isSameRuleIdentity(rule, draft),
+  );
+
+  return setActiveRules(nextRules);
+}
+
 async function ensureDraftState() {
   const stored = await chrome.storage.local.get([
     STORAGE_KEYS.activeDraft,
+    STORAGE_KEYS.activeRules,
     STORAGE_KEYS.workspaceDraft,
   ]);
 
   const rawActiveDraft = stored[STORAGE_KEYS.activeDraft];
+  const rawActiveRules = stored[STORAGE_KEYS.activeRules];
   const rawWorkspaceDraft = stored[STORAGE_KEYS.workspaceDraft];
   const activeDraft = hydrateStoredDraft(rawActiveDraft);
+  const activeRules = normalizeActiveRules(rawActiveRules);
   let workspaceDraft = hydrateStoredDraft(rawWorkspaceDraft);
   const updates = {};
   const removals = [];
@@ -967,6 +1130,10 @@ async function ensureDraftState() {
 
   if (hasLegacyTargetMetadata(rawWorkspaceDraft) && workspaceDraft) {
     updates[STORAGE_KEYS.workspaceDraft] = workspaceDraft;
+  }
+
+  if (Array.isArray(rawActiveRules) && rawActiveRules.length !== activeRules.length) {
+    updates[STORAGE_KEYS.activeRules] = activeRules;
   }
 
   if (!workspaceDraft) {
@@ -987,6 +1154,7 @@ async function ensureDraftState() {
 
   return {
     activeDraft,
+    activeRules,
     workspaceDraft,
   };
 }
@@ -2545,6 +2713,7 @@ function normalizeDraft(payload) {
         ? payload.id.trim()
         : null,
     name: typeof payload?.name === "string" ? payload.name.trim() : "",
+    enabled: payload?.enabled !== false,
     matchPattern:
       typeof payload?.matchPattern === "string" && payload.matchPattern.trim()
         ? payload.matchPattern.trim()
@@ -2653,6 +2822,7 @@ async function persistRule(rule) {
   const normalizedRule = normalizeRuleRecord(rule);
   const requestBody = {
     name: readRequiredRuleName(normalizedRule.name),
+    enabled: normalizedRule.enabled,
     matchPattern: normalizedRule.matchPattern,
     html: normalizedRule.html,
     css: normalizedRule.css,

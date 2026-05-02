@@ -25,6 +25,7 @@ export type RuleChatMessage = {
 
 export type RuleInput = {
   name: string;
+  enabled: boolean;
   matchPattern: string;
   html: string;
   css: string;
@@ -36,6 +37,7 @@ export type RuleInput = {
 
 export type StoredRuleInput = {
   name: string;
+  enabled: boolean;
   matchPattern: string;
   html: string;
   css: string;
@@ -48,6 +50,7 @@ export type StoredRuleInput = {
 export type StoredRuleRecord = {
   id: string;
   name: string;
+  enabled: boolean;
   matchPattern: string;
   html: string;
   css: string;
@@ -65,6 +68,7 @@ export function normalizeRuleInput(payload: unknown): RuleInput {
 
   return {
     name: readRequiredString(record.name, "Rule name is required."),
+    enabled: readBoolean(record.enabled, true),
     matchPattern: readString(record.matchPattern, DEFAULT_MATCH_PATTERN),
     html: readText(record.html),
     css: readText(record.css),
@@ -78,6 +82,7 @@ export function normalizeRuleInput(payload: unknown): RuleInput {
 export function serializeStoredRuleInput(rule: RuleInput): StoredRuleInput {
   return {
     name: rule.name,
+    enabled: rule.enabled,
     matchPattern: rule.matchPattern,
     html: rule.html,
     css: rule.css,
@@ -138,6 +143,10 @@ function readString(value: unknown, fallback: string) {
 
 function readText(value: unknown) {
   return typeof value === "string" ? value : "";
+}
+
+function readBoolean(value: unknown, fallback: boolean) {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 function readNullableString(value: unknown) {
